@@ -43,17 +43,22 @@ object CaptionHook : BaseHook {
     private val bilingualCaptionOffsets = WeakHashMap<ViewGroup, BilingualCaptionOffsets>()
     private val captionWindowClasses = ConcurrentHashMap.newKeySet<Class<*>>()
     private val captionWindowFields = ConcurrentHashMap<Class<*>, List<Field>>()
+    private val captionWindowTextFields = ConcurrentHashMap<Class<*>, List<Field>>()
     private val captionAccumulatorEventListFields = ConcurrentHashMap<Class<*>, List<Field>>()
     private val captionEventWindowListFields = ConcurrentHashMap<Class<*>, List<Field>>()
     private val captionWindowLookupFailures = ConcurrentHashMap.newKeySet<Class<*>>()
     private val captionWindowParseFailures = ConcurrentHashMap.newKeySet<Class<*>>()
+    private val captionWindowRewriteFailures = ConcurrentHashMap.newKeySet<Class<*>>()
     private val captionAccumulatorParseFailures = ConcurrentHashMap.newKeySet<Class<*>>()
     private val captionEventParseFailures = ConcurrentHashMap.newKeySet<Class<*>>()
     private val captionPrefetchMisses = ConcurrentHashMap.newKeySet<String>()
     private val captionStateLock = Any()
+    @Volatile
+    private var captionTimelineIsRolling = false
     private val captionGeneration = AtomicLong(0L)
     private val rendererSequence = AtomicLong(0L)
     private val applyingTranslatedText = ThreadLocal.withInitial { false }
+    private val rewritingCaptionWindow = ThreadLocal.withInitial { false }
 
     override fun install(dexkit: DexKitBridge): Int {
         var installed = 0
@@ -178,7 +183,7 @@ object CaptionHook : BaseHook {
                     ?: return@hook chain.proceed()
                 val normalizedOriginal = CaptionCue.normalize(original.toString())
                 val parent = (thisObject as View).parent
-                if (parent != null) {
+                if (parent != null && rewritingCaptionWindow.get() != true) {
                     val windowArg = parent.captionWindowFieldValue()
                     val newCues = observeCaptionWindow(parent, windowArg)
                     logObservedCueCount(newCues.size, source = "window")
@@ -206,7 +211,12 @@ object CaptionHook : BaseHook {
                             captionWindow.displayText,
                             translated,
                         )
-                        if (parent != null && parent.hasCaptionTextLines(formatted)) {
+                        val renderedExpectedEntry = formatted.captionLines().any { entry ->
+                            CaptionCue.normalize(entry.toString()) == normalizedOriginal
+                        }
+                        if (renderedExpectedEntry &&
+                            parent != null && parent.hasCaptionTextLines(formatted)
+                        ) {
                             return@hook chain.proceed()
                         }
                         val replacement = replacementForCaptionWindow(
@@ -294,8 +304,23 @@ object CaptionHook : BaseHook {
                     }
                     logObservedCueCount(newCues.size, source)
                 }
-                val result = chain.proceed()
-                if (module.config.enabled && arg !is List<*>) {
+                val restoredFields = if (module.config.enabled && arg != null && arg !is List<*>) {
+                    replaceCaptionWindowTextFields(chain.thisObject, arg)
+                } else {
+                    emptyList()
+                }
+                val rewriting = restoredFields.isNotEmpty()
+                val wasRewriting = rewritingCaptionWindow.get()
+                val result = try {
+                    if (rewriting) rewritingCaptionWindow.set(true)
+                    chain.proceed()
+                } finally {
+                    if (rewriting) rewritingCaptionWindow.set(wasRewriting)
+                    if (arg != null) {
+                        restoredFields.forEach { value -> value.restore(arg) }
+                    }
+                }
+                if (module.config.enabled && arg !is List<*> && restoredFields.isEmpty()) {
                     applyCachedTranslationToCaptionWindow(chain.thisObject)
                 }
                 result
@@ -426,8 +451,14 @@ object CaptionHook : BaseHook {
         val distinctEndCount = lines.mapTo(HashSet()) { it.endMs }.size
         val isRolling = lines.isNotEmpty() &&
                 distinctEndCount * ROLLING_TIMELINE_END_RATIO < lines.size
-        val windows = timelineWindows(lines, isRolling, useFullTextPrefixGuard)
+        val rawWindows = timelineWindows(lines, isRolling, useFullTextPrefixGuard)
+        val windows = if (isRolling) {
+            groupedRollingTimelineWindows(rawWindows)
+        } else {
+            rawWindows
+        }
         val (stored, generation) = synchronized(captionStateLock) {
+            captionTimelineIsRolling = isRolling
             val count = session.replaceCaptionTimeline(
                 windows.map { window -> window.startMs to window.text },
             )
@@ -446,13 +477,169 @@ object CaptionHook : BaseHook {
             logV(
                 name,
                 "Observed caption timeline window batch, cues=${lines.size}, windows=$stored, " +
+                    "segments=${windows.mapTo(HashSet()) { window -> window.text }.size}, " +
                     "rolling=$isRolling",
             )
         }
     }
 
+    private fun groupedRollingTimelineWindows(windows: List<TimelineWindow>): List<TimelineWindow> {
+        if (windows.size < 2) return windows
+
+        val grouped = ArrayList<TimelineWindow>(windows.size)
+        var runStart = 0
+        for (index in 1..windows.size) {
+            if (index < windows.size &&
+                windows[index].startMs - windows[index - 1].startMs <= MAX_ROLLING_SEGMENT_GAP_MS
+            ) {
+                continue
+            }
+
+            grouped += groupedRollingTimelineRun(windows.subList(runStart, index))
+            runStart = index
+        }
+        return grouped
+    }
+
+    private fun groupedRollingTimelineRun(windows: List<TimelineWindow>): List<TimelineWindow> {
+        if (windows.size < 2) return windows
+
+        val transcript = StringBuilder()
+        val windowTextStarts = IntArray(windows.size)
+        windows.forEachIndexed { index, window ->
+            if (transcript.isNotEmpty()) transcript.append(' ')
+            windowTextStarts[index] = transcript.length
+            transcript.append(window.text)
+        }
+        val text = transcript.toString()
+        val segments = rollingTextSegments(text)
+        if (segments.isEmpty()) return windows
+
+        val segmentByWindow = IntArray(windows.size)
+        var segmentIndex = 0
+        windowTextStarts.forEachIndexed { windowIndex, textStart ->
+            while (segmentIndex < segments.lastIndex &&
+                textStart >= segments[segmentIndex].endIndex
+            ) {
+                segmentIndex++
+            }
+            segmentByWindow[windowIndex] = segmentIndex
+        }
+
+        val occupiedSegments = segmentByWindow.distinct()
+        val displayTextBySegment = HashMap<Int, String>(occupiedSegments.size)
+        occupiedSegments.forEachIndexed { index, occupiedSegment ->
+            val startIndex = segments[occupiedSegment].startIndex
+            val endIndex = occupiedSegments.getOrNull(index + 1)
+                ?.let { nextSegment -> segments[nextSegment].startIndex }
+                ?: text.length
+            displayTextBySegment[occupiedSegment] =
+                CaptionCue.normalize(text.substring(startIndex, endIndex))
+        }
+
+        return windows.mapIndexed { index, window ->
+            TimelineWindow(
+                startMs = window.startMs,
+                text = displayTextBySegment.getValue(segmentByWindow[index]),
+            )
+        }
+    }
+
+    private fun rollingTextSegments(text: String): List<TextRange> {
+        val parts = ArrayList<TextRange>()
+        var startIndex = 0
+        sentenceBoundary.findAll(text).forEach { boundary ->
+            appendRollingTextParts(text, startIndex, boundary.range.last + 1, parts)
+            startIndex = boundary.range.last + 1
+        }
+        appendRollingTextParts(text, startIndex, text.length, parts)
+
+        val segments = ArrayList<TextRange>(parts.size)
+        for (part in parts) {
+            val previous = segments.lastOrNull()
+            if (previous != null &&
+                part.endIndex - previous.startIndex <= MAX_ROLLING_SEGMENT_LENGTH
+            ) {
+                segments[segments.lastIndex] = TextRange(previous.startIndex, part.endIndex)
+            } else {
+                segments += part
+            }
+        }
+        return segments
+    }
+
+    private fun appendRollingTextParts(
+        text: String,
+        rangeStart: Int,
+        rangeEnd: Int,
+        parts: MutableList<TextRange>,
+    ) {
+        var startIndex = rangeStart
+        while (startIndex < rangeEnd && text[startIndex].isWhitespace()) startIndex++
+        var endIndex = rangeEnd
+        while (endIndex > startIndex && text[endIndex - 1].isWhitespace()) endIndex--
+
+        while (endIndex - startIndex > MAX_ROLLING_SEGMENT_LENGTH) {
+            val remainingLength = endIndex - startIndex
+            val remainingParts =
+                (remainingLength + MAX_ROLLING_SEGMENT_LENGTH - 1) /
+                        MAX_ROLLING_SEGMENT_LENGTH
+            val targetEnd = startIndex +
+                    (remainingLength + remainingParts - 1) / remainingParts
+            val minimumEnd = maxOf(
+                endIndex - (remainingParts - 1) * MAX_ROLLING_SEGMENT_LENGTH,
+                startIndex + MIN_ROLLING_SEGMENT_LENGTH,
+            )
+            val maximumEnd = minOf(startIndex + MAX_ROLLING_SEGMENT_LENGTH, endIndex)
+            val clauseEnd = clauseBoundary.findAll(text, startIndex)
+                .map { boundary -> boundary.range.last + 1 }
+                .takeWhile { boundaryEnd -> boundaryEnd <= maximumEnd }
+                .filter { boundaryEnd -> boundaryEnd >= minimumEnd }
+                .minByOrNull { boundaryEnd ->
+                    if (boundaryEnd >= targetEnd) {
+                        boundaryEnd - targetEnd
+                    } else {
+                        targetEnd - boundaryEnd
+                    }
+                }
+            val splitIndex = clauseEnd
+                ?: closestWhitespace(text, minimumEnd, maximumEnd, targetEnd)
+                ?: maximumEnd
+            var trimmedSplitIndex = splitIndex
+            while (trimmedSplitIndex > startIndex && text[trimmedSplitIndex - 1].isWhitespace()) {
+                trimmedSplitIndex--
+            }
+            parts += TextRange(startIndex, trimmedSplitIndex)
+            startIndex = splitIndex
+            while (startIndex < endIndex && text[startIndex].isWhitespace()) startIndex++
+        }
+        if (startIndex < endIndex) {
+            parts += TextRange(startIndex, endIndex)
+        }
+    }
+
+    private fun closestWhitespace(
+        text: String,
+        minimumEnd: Int,
+        maximumEnd: Int,
+        targetEnd: Int,
+    ): Int? {
+        var closest: Int? = null
+        var closestDistance = Int.MAX_VALUE
+        for (index in minimumEnd..maximumEnd) {
+            if (index >= text.length || !text[index].isWhitespace()) continue
+            val distance = if (index >= targetEnd) index - targetEnd else targetEnd - index
+            if (distance < closestDistance) {
+                closest = index
+                closestDistance = distance
+            }
+        }
+        return closest
+    }
+
     private fun clearCaptionTimeline() {
         val cleared = synchronized(captionStateLock) {
+            captionTimelineIsRolling = false
             val count = session.replaceCaptionTimeline(emptyList())
             if (count >= 0) captionGeneration.incrementAndGet()
             count >= 0
@@ -617,7 +804,9 @@ object CaptionHook : BaseHook {
                 "id=${window.cue.windowId}, time=${window.cue.startMs}, " +
                 "currentLength=${window.currentText.length}, fullLength=${window.fullText.length}, " +
                 "sourceLines=${window.fullText.count { character -> character == '\n' } + 1}, " +
-                "segmentLength=${window.displayText.length}, segmentHash=${window.displayText.logHash()}, " +
+                "segmentLength=${window.displayText.length}, " +
+                "timelineGrouped=${window.isTimelineGrouped}, " +
+                "segmentHash=${window.displayText.logHash()}, " +
                 "owner=${owner.javaClass.simpleName}@${System.identityHashCode(owner)}",
         )
         requestCaptionWindowTranslations(window, source = "window")
@@ -722,14 +911,23 @@ object CaptionHook : BaseHook {
             .filter { it != fullText }
             .firstOrNull { normalizedFullText.startsWith(CaptionCue.normalize(it)) }
             ?: fullText
-        val isRolling = CaptionCue.normalize(currentText) != normalizedFullText
-        val displayText = captionDisplayText(fullText, isRolling)
+        val startMs = values.filterIsInstance<Long>().firstOrNull()
+            ?: CaptionCue.UNKNOWN_TIME_MS
+        val detectedRolling = CaptionCue.normalize(currentText) != normalizedFullText
+        val timelineDisplayText = if (detectedRolling || captionTimelineIsRolling) {
+            session.timelineCaptionTextAt(startMs)
+        } else {
+            null
+        }
+        val isRolling = detectedRolling ||
+                (captionTimelineIsRolling && timelineDisplayText != null)
+        val nativeDisplayText = captionDisplayText(fullText, isRolling)
+        val displayText = timelineDisplayText ?: nativeDisplayText
 
         return CaptionWindow(
             cue = CaptionCue(
                 videoId = "",
-                startMs = values.filterIsInstance<Long>().firstOrNull()
-                    ?: CaptionCue.UNKNOWN_TIME_MS,
+                startMs = startMs,
                 endMs = CaptionCue.UNKNOWN_TIME_MS,
                 text = displayText,
                 windowId = values.filterIsInstance<Int>().firstOrNull()
@@ -739,6 +937,7 @@ object CaptionHook : BaseHook {
             fullText = fullText,
             displayText = displayText,
             isRolling = isRolling,
+            isTimelineGrouped = timelineDisplayText != null && timelineDisplayText != nativeDisplayText,
         )
     }
 
@@ -941,6 +1140,7 @@ object CaptionHook : BaseHook {
 
         synchronized(captionStateLock) {
             captionGeneration.incrementAndGet()
+            captionTimelineIsRolling = false
             session.clear()
         }
         restoreAllBilingualCaptionOffsets()
@@ -989,7 +1189,7 @@ object CaptionHook : BaseHook {
             return renderedFragment
         }
         val isAnchor = displayText == fragment || if (window.isRolling) {
-            displayText.startsWith(fragment)
+            displayText.contains(fragment)
         } else {
             displayText.endsWith(fragment)
         }
@@ -1013,19 +1213,46 @@ object CaptionHook : BaseHook {
         )
     }
 
+    private fun replaceCaptionWindowTextFields(owner: Any?, arg: Any): List<RestorableFieldValue> {
+        val window = arg.toCaptionWindow() ?: return emptyList()
+        val translated = session.translationFor(window.displayText)
+        if (translated == null && !window.isRolling) return emptyList()
+        val replacement = BilingualFormatter.format(window.displayText, translated)
+        val fields = captionWindowTextFields.getOrPut(arg.javaClass) {
+            arg.instanceFields().filter { field ->
+                CharSequence::class.java.isAssignableFrom(field.type)
+            }
+        }
+        if (fields.isEmpty()) return emptyList()
+
+        val values = ArrayList<RestorableFieldValue>(fields.size)
+        for (field in fields) {
+            val original = field.getValueOrNull(arg)
+            val replaced = runCatching {
+                field.isAccessible = true
+                field.set(arg, replacement)
+            }.isSuccess
+            if (!replaced) {
+                values.asReversed().forEach { value -> value.restore(arg) }
+                if (captionWindowRewriteFailures.add(arg.javaClass)) {
+                    logV(name, "Unable to rewrite caption window text for ${arg.javaClass.name}")
+                }
+                return emptyList()
+            }
+            values += RestorableFieldValue(field, original)
+        }
+        if (owner != null) {
+            rememberBilingualCaptionEntries(owner, replacement)
+        }
+        return values
+    }
+
     private fun updateCaptionWindowTextLists(owner: Any, replacement: CharSequence): Boolean {
         val textLists = owner.captionTextLists()
         if (textLists.isEmpty()) return false
 
         val replacementEntries = replacement.captionLines()
-        synchronized(bilingualCaptionEntries) {
-            if (replacementEntries.size == 2) {
-                bilingualCaptionEntries[owner] = replacementEntries.map { it.toString() }
-            } else {
-                restoreBilingualCaptionOffsets(owner)
-                bilingualCaptionEntries.remove(owner)
-            }
-        }
+        rememberBilingualCaptionEntries(owner, replacementEntries)
         var changed = false
         for (list in textLists) {
             if (list.hasSameTextAs(replacementEntries)) continue
@@ -1045,6 +1272,24 @@ object CaptionHook : BaseHook {
             )
         }
         return true
+    }
+
+    private fun rememberBilingualCaptionEntries(owner: Any, replacement: CharSequence) {
+        rememberBilingualCaptionEntries(owner, replacement.captionLines())
+    }
+
+    private fun rememberBilingualCaptionEntries(
+        owner: Any,
+        replacementEntries: List<CharSequence>,
+    ) {
+        synchronized(bilingualCaptionEntries) {
+            if (replacementEntries.size == 2) {
+                bilingualCaptionEntries[owner] = replacementEntries.map { it.toString() }
+            } else {
+                restoreBilingualCaptionOffsets(owner)
+                bilingualCaptionEntries.remove(owner)
+            }
+        }
     }
 
     private fun Any.captionTextLists(): List<MutableList<*>> =
@@ -1449,6 +1694,11 @@ object CaptionHook : BaseHook {
     private const val CAPTION_PREFETCH_WINDOW_COUNT = 12
     private const val CAPTION_TRANSLATION_BATCH_SIZE = 4
     private const val ROLLING_TIMELINE_END_RATIO = 2
+    private const val MAX_ROLLING_SEGMENT_LENGTH = 100
+    private const val MIN_ROLLING_SEGMENT_LENGTH = 40
+    private const val MAX_ROLLING_SEGMENT_GAP_MS = 5_000L
+    private val sentenceBoundary = Regex("[.!?。！？…]+[\\\"'”’）)\\]]*(?=\\s|$)")
+    private val clauseBoundary = Regex("[,;:，；：]+[\\\"'”’）)\\]]*(?=\\s|$)")
 
     private fun String.logHash(): String =
         Integer.toHexString(CaptionCue.normalize(this).hashCode())
@@ -1459,12 +1709,10 @@ object CaptionHook : BaseHook {
             .replace('\r', '\n')
             .split('\n')
             .map { line -> CaptionCue.normalize(line) }
-        val displayLines = if (isRolling) {
-            listOf(lines.lastOrNull { line -> line.isNotEmpty() }.orEmpty())
-        } else {
-            lines
+        if (!isRolling) {
+            return lines.joinToString("\n").trim()
         }
-        return displayLines.joinToString("\n").trim()
+        return lines.lastOrNull { line -> line.isNotEmpty() }.orEmpty()
     }
 
     private data class RendererState(
@@ -1480,6 +1728,7 @@ object CaptionHook : BaseHook {
         val fullText: String,
         val displayText: String,
         val isRolling: Boolean,
+        val isTimelineGrouped: Boolean,
     )
 
     private data class BilingualCaptionOffsets(
@@ -1501,4 +1750,21 @@ object CaptionHook : BaseHook {
         val startMs: Long,
         val text: String,
     )
+
+    private data class TextRange(
+        val startIndex: Int,
+        val endIndex: Int,
+    )
+
+    private data class RestorableFieldValue(
+        val field: Field,
+        val value: Any?,
+    ) {
+        fun restore(instance: Any) {
+            runCatching {
+                field.isAccessible = true
+                field.set(instance, value)
+            }
+        }
+    }
 }

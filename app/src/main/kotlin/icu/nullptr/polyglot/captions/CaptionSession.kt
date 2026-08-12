@@ -11,6 +11,7 @@ class CaptionSession {
     private val renderedTexts = ConcurrentHashMap<String, Long>()
     private val captionEventBatches = ArrayDeque<CaptionEventBatch>()
     private var captionTimeline = emptyList<TimedCaption>()
+    private var captionTimelineTextByStartMs = emptyMap<Long, String>()
     private var captionTimelineCursor = -1
     private val observedCueCounter = AtomicInteger(0)
 
@@ -35,6 +36,7 @@ class CaptionSession {
         synchronized(captionEventBatches) {
             captionEventBatches.clear()
             captionTimeline = emptyList()
+            captionTimelineTextByStartMs = emptyMap()
             captionTimelineCursor = -1
         }
         observedCueCounter.set(0)
@@ -56,10 +58,39 @@ class CaptionSession {
             }
 
             captionTimeline = normalizedEntries
+            captionTimelineTextByStartMs = normalizedEntries.associate { entry ->
+                entry.startMs to entry.text
+            }
             captionTimelineCursor = -1
             captionEventBatches.clear()
         }
         return normalizedEntries.size
+    }
+
+    fun timelineCaptionTextAt(startMs: Long): String? {
+        if (startMs == CaptionCue.UNKNOWN_TIME_MS) return null
+        synchronized(captionEventBatches) {
+            captionTimelineTextByStartMs[startMs]?.let { return it }
+
+            var low = 0
+            var high = captionTimeline.lastIndex
+            var floorIndex = -1
+            while (low <= high) {
+                val middle = (low + high).ushr(1)
+                if (captionTimeline[middle].startMs <= startMs) {
+                    floorIndex = middle
+                    low = middle + 1
+                } else {
+                    high = middle - 1
+                }
+            }
+            if (floorIndex < 0) return null
+
+            val floor = captionTimeline[floorIndex]
+            return floor.text.takeIf {
+                startMs - floor.startMs <= MAX_TIMELINE_LOOKUP_GAP_MS
+            }
+        }
     }
 
     fun observeCaptionEventBatch(texts: Iterable<String>): Int {
@@ -188,6 +219,7 @@ class CaptionSession {
     private companion object {
         const val UNCHANGED_TIMELINE = -1
         const val MAX_CAPTION_EVENT_BATCHES = 8
+        const val MAX_TIMELINE_LOOKUP_GAP_MS = 5_000L
         const val RENDERED_TEXT_LOG_INTERVAL_MS = 30_000L
     }
 }
