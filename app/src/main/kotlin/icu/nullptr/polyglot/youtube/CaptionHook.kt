@@ -33,7 +33,7 @@ import java.util.concurrent.atomic.AtomicLong
 
 object CaptionHook : BaseHook {
     override val name = "CaptionHook"
-    override val totalHooks = 5
+    override val totalHooks = 6
 
     private val session = CaptionSession()
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -41,6 +41,7 @@ object CaptionHook : BaseHook {
     private val rendererStates = WeakHashMap<Any, RendererState>()
     private val bilingualCaptionEntries = WeakHashMap<Any, List<String>>()
     private val bilingualCaptionOffsets = WeakHashMap<ViewGroup, BilingualCaptionOffsets>()
+    private val captionWindowFullscreenStates = WeakHashMap<View, Boolean>()
     private val captionWindowClasses = ConcurrentHashMap.newKeySet<Class<*>>()
     private val captionWindowFields = ConcurrentHashMap<Class<*>, List<Field>>()
     private val captionWindowTextFields = ConcurrentHashMap<Class<*>, List<Field>>()
@@ -68,6 +69,10 @@ object CaptionHook : BaseHook {
         }
 
         if (installOverlayUpdateHooks(dexkit)) {
+            installed++
+        }
+
+        if (installCaptionTextSizeHooks(dexkit)) {
             installed++
         }
 
@@ -339,6 +344,86 @@ object CaptionHook : BaseHook {
             logW(name, "Caption overlay update methods not found")
         }
         return installed > 0
+    }
+
+    private fun installCaptionTextSizeHooks(dexkit: DexKitBridge): Boolean {
+        val captionWindowClassNames = dexkit.findCaptionWindowClassNames()
+        val methods = dexkit.findCaptionWindowUpdateMethods(captionWindowClassNames)
+            .map { it.toMethod().declaringClass }
+            .filter { clazz -> ViewGroup::class.java.isAssignableFrom(clazz) }
+            .distinct()
+            .flatMap { clazz ->
+                clazz.declaredMethods.filter { method ->
+                    !Modifier.isStatic(method.modifiers) &&
+                            method.returnType == Void.TYPE &&
+                            method.parameterTypes.contentEquals(arrayOf(Float::class.javaPrimitiveType))
+                }
+            }
+            .onEach { method -> method.isAccessible = true }
+            .distinctBy { it.stableId() }
+
+        for (method in methods) {
+            hook(method) { chain ->
+                val window = chain.thisObject as? View ?: return@hook chain.proceed()
+                val requestedTextSize = (chain.getArg(0) as? Number)?.toFloat()
+                    ?: return@hook chain.proceed()
+                val fullscreen = window.isFullscreenCaptionWindow()
+                val previousFullscreen = synchronized(captionWindowFullscreenStates) {
+                    captionWindowFullscreenStates.put(window, fullscreen)
+                }
+                if (previousFullscreen != fullscreen) {
+                    val overlay = window.parent as? View
+                    val root = overlay?.rootView
+                    val metrics = window.resources.displayMetrics
+                    logV(
+                        name,
+                        "Caption window mode changed, fullscreen=$fullscreen, " +
+                                "textSize=$requestedTextSize, owner=${window.javaClass.simpleName}, " +
+                                "overlay=${overlay?.measuredWidth}x${overlay?.measuredHeight}, " +
+                                "root=${root?.measuredWidth}x${root?.measuredHeight}, " +
+                                "display=${metrics.widthPixels}x${metrics.heightPixels}",
+                    )
+                }
+
+                if (fullscreen) {
+                    chain.proceed(arrayOf(requestedTextSize * FULLSCREEN_CAPTION_TEXT_SCALE))
+                } else {
+                    chain.proceed()
+                }
+            }
+
+            logD(name, "Hooked caption text size: ${method.shortName()}")
+        }
+
+        if (methods.isEmpty()) {
+            logW(name, "Caption text size methods not found")
+        }
+        return methods.isNotEmpty()
+    }
+
+    private fun View.isFullscreenCaptionWindow(): Boolean {
+        val overlay = parent as? View ?: return false
+        val overlayWidth = overlay.measuredWidth.takeIf { it > 0 } ?: overlay.width
+        val overlayHeight = overlay.measuredHeight.takeIf { it > 0 } ?: overlay.height
+        if (overlayWidth <= 0 || overlayHeight <= 0) return false
+
+        val root = overlay.rootView
+        val metrics = resources.displayMetrics
+        fun covers(width: Int, height: Int): Boolean {
+            if (width <= 0 || height <= 0) return false
+            val widthCoverage = overlayWidth.toFloat() / width
+            val heightCoverage = overlayHeight.toFloat() / height
+            return (widthCoverage >= FULLSCREEN_CAPTION_MIN_MAIN_COVERAGE ||
+                    heightCoverage >= FULLSCREEN_CAPTION_MIN_MAIN_COVERAGE) &&
+                    widthCoverage >= FULLSCREEN_CAPTION_MIN_CROSS_COVERAGE &&
+                    heightCoverage >= FULLSCREEN_CAPTION_MIN_CROSS_COVERAGE
+        }
+
+        val coversRoot = root !== overlay && covers(
+            root.measuredWidth.takeIf { it > 0 } ?: root.width,
+            root.measuredHeight.takeIf { it > 0 } ?: root.height,
+        )
+        return coversRoot || covers(metrics.widthPixels, metrics.heightPixels)
     }
 
     private fun installCaptionEventHook(dexkit: DexKitBridge): Boolean {
@@ -1699,6 +1784,9 @@ object CaptionHook : BaseHook {
     private const val MAX_ROLLING_SEGMENT_LENGTH = 100
     private const val MIN_ROLLING_SEGMENT_LENGTH = 40
     private const val MAX_ROLLING_SEGMENT_GAP_MS = 5_000L
+    private const val FULLSCREEN_CAPTION_TEXT_SCALE = 0.7f
+    private const val FULLSCREEN_CAPTION_MIN_MAIN_COVERAGE = 0.9f
+    private const val FULLSCREEN_CAPTION_MIN_CROSS_COVERAGE = 0.5f
     private val sentenceBoundary = Regex("[.!?。！？…]+[\\\"'”’）)\\]]*(?=\\s|$)")
     private val clauseBoundary = Regex("[,;:，；：]+[\\\"'”’）)\\]]*(?=\\s|$)")
 
