@@ -1,5 +1,8 @@
 package icu.nullptr.polyglot.youtube
 
+import android.app.Activity
+import android.content.Context
+import android.content.ContextWrapper
 import android.os.Handler
 import android.os.Looper
 import android.text.Editable
@@ -38,10 +41,11 @@ object CaptionHook : BaseHook {
     private val session = CaptionSession()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val captionWindows = WeakHashMap<Any, CaptionWindow>()
+    private val nativeCaptionWindowUpdates = WeakHashMap<Any, NativeCaptionWindowUpdate>()
     private val rendererStates = WeakHashMap<Any, RendererState>()
     private val bilingualCaptionEntries = WeakHashMap<Any, List<String>>()
     private val bilingualCaptionOffsets = WeakHashMap<ViewGroup, BilingualCaptionOffsets>()
-    private val captionWindowFullscreenStates = WeakHashMap<View, Boolean>()
+    private val captionTextSizeStates = WeakHashMap<View, CaptionTextSizeState>()
     private val captionWindowClasses = ConcurrentHashMap.newKeySet<Class<*>>()
     private val captionWindowFields = ConcurrentHashMap<Class<*>, List<Field>>()
     private val captionWindowTextFields = ConcurrentHashMap<Class<*>, List<Field>>()
@@ -56,10 +60,12 @@ object CaptionHook : BaseHook {
     private val captionStateLock = Any()
     @Volatile
     private var captionTimelineIsRolling = false
+    private val captionTrackEpoch = AtomicLong(0L)
     private val captionGeneration = AtomicLong(0L)
     private val rendererSequence = AtomicLong(0L)
     private val applyingTranslatedText = ThreadLocal.withInitial { false }
     private val rewritingCaptionWindow = ThreadLocal.withInitial { false }
+    private val reapplyingCaptionTextSize = ThreadLocal.withInitial { false }
 
     override fun install(dexkit: DexKitBridge): Int {
         var installed = 0
@@ -98,28 +104,34 @@ object CaptionHook : BaseHook {
     }
 
     fun onEnabledChanged(enabled: Boolean) {
-        if (enabled) return
-
-        synchronized(captionStateLock) {
-            captionGeneration.incrementAndGet()
+        if (!enabled) {
+            synchronized(captionStateLock) {
+                captionGeneration.incrementAndGet()
+            }
         }
         mainHandler.post {
-            if (module.config.enabled) return@post
+            if (module.config.enabled != enabled) return@post
 
-            restoreAllBilingualCaptionOffsets()
-            val activeWindows = synchronized(captionWindows) {
-                captionWindows.entries.map { (owner, window) -> owner to window }
-            }
-            activeWindows.forEach { (owner, window) ->
-                updateCaptionWindowTextLists(owner, window.displayText)
-            }
-            synchronized(bilingualCaptionEntries) {
-                bilingualCaptionEntries.clear()
+            refreshAllCaptionTextSizes()
+            if (enabled) {
+                replayNativeCaptionWindowUpdates()
+                val activeWindows = activeCaptionWindows()
+                activeWindows.forEach { (owner, window) ->
+                    applyCachedTranslationToCaptionWindow(owner)
+                    requestCaptionWindowTranslations(window, source = "enabled")
+                }
+            } else {
+                restoreAllBilingualCaptionOffsets()
+                replayNativeCaptionWindowUpdates()
+                synchronized(bilingualCaptionEntries) {
+                    bilingualCaptionEntries.clear()
+                }
             }
         }
     }
 
     fun onTranslationSettingsChanged() {
+        TranslationManager.onSettingsChanged()
         synchronized(captionStateLock) {
             captionGeneration.incrementAndGet()
             session.clearTranslations()
@@ -127,15 +139,36 @@ object CaptionHook : BaseHook {
         mainHandler.post {
             if (!module.config.enabled) return@post
 
-            val activeWindows = synchronized(captionWindows) {
-                captionWindows.entries.map { (owner, window) -> owner to window }
-            }
-            activeWindows.forEach { (owner, window) ->
+            activeCaptionWindows().forEach { (owner, window) ->
                 updateCaptionWindowTextLists(owner, window.displayText)
                 requestCaptionWindowTranslations(window, source = "settings")
             }
         }
     }
+
+    fun onSubtitleModeChanged() {
+        mainHandler.post {
+            if (!module.config.enabled) return@post
+
+            val rendererFallbacks = LinkedHashSet<String>()
+            activeCaptionWindows().forEach { (owner, window) ->
+                val translated = session.translationFor(window.displayText)
+                    ?: return@forEach
+                val replacement = BilingualFormatter.format(window.displayText, translated)
+                if (!updateCaptionWindowTextLists(owner, replacement)) {
+                    rendererFallbacks += window.displayText
+                }
+            }
+            rendererFallbacks.forEach { text ->
+                refreshVisibleRenderers(text, source = "subtitle mode")
+            }
+        }
+    }
+
+    private fun activeCaptionWindows(): List<Pair<Any, CaptionWindow>> =
+        synchronized(captionWindows) {
+            captionWindows.entries.map { (owner, window) -> owner to window }
+        }
 
     private fun installTimelineBuildHook(dexkit: DexKitBridge): Boolean {
         val method = dexkit.findCaptionTimelineBuildMethod()
@@ -145,9 +178,10 @@ object CaptionHook : BaseHook {
         }
 
         hook(method) { chain ->
+            val expectedTrackEpoch = captionTrackEpoch.get()
             val result = chain.proceed()
-            if (module.config.enabled) {
-                val newCues = observeTimeline(result)
+            if (module.config.enabled && expectedTrackEpoch == captionTrackEpoch.get()) {
+                val newCues = observeTimeline(result, expectedTrackEpoch)
                 logObservedCueCount(newCues.size, source = "timeline")
             }
             result
@@ -300,6 +334,9 @@ object CaptionHook : BaseHook {
         for (method in methods) {
             hook(method) { chain ->
                 val arg = chain.getArg(0)
+                if (arg != null && arg !is List<*>) {
+                    rememberNativeCaptionWindowUpdate(chain.thisObject, arg, method)
+                }
                 if (module.config.enabled) {
                     val source = if (arg is List<*>) "overlay" else "window"
                     val newCues = if (arg is List<*>) {
@@ -364,29 +401,34 @@ object CaptionHook : BaseHook {
 
         for (method in methods) {
             hook(method) { chain ->
+                if (reapplyingCaptionTextSize.get() == true) {
+                    return@hook chain.proceed()
+                }
+
                 val window = chain.thisObject as? View ?: return@hook chain.proceed()
                 val requestedTextSize = (chain.getArg(0) as? Number)?.toFloat()
                     ?: return@hook chain.proceed()
-                val fullscreen = window.isFullscreenCaptionWindow()
-                val previousFullscreen = synchronized(captionWindowFullscreenStates) {
-                    captionWindowFullscreenStates.put(window, fullscreen)
+                val fullscreen = module.config.enabled &&
+                        window.fullscreenCaptionWindowState() == true
+                val appliedTextSize = if (fullscreen) {
+                    requestedTextSize * FULLSCREEN_CAPTION_TEXT_SCALE
+                } else {
+                    requestedTextSize
                 }
+                val previousFullscreen = rememberCaptionTextSize(
+                    window = window,
+                    method = method,
+                    rawTextSize = requestedTextSize,
+                    appliedTextSize = appliedTextSize,
+                    fullscreen = fullscreen,
+                )
                 if (previousFullscreen != fullscreen) {
-                    val overlay = window.parent as? View
-                    val root = overlay?.rootView
-                    val metrics = window.resources.displayMetrics
-                    logV(
-                        name,
-                        "Caption window mode changed, fullscreen=$fullscreen, " +
-                                "textSize=$requestedTextSize, owner=${window.javaClass.simpleName}, " +
-                                "overlay=${overlay?.measuredWidth}x${overlay?.measuredHeight}, " +
-                                "root=${root?.measuredWidth}x${root?.measuredHeight}, " +
-                                "display=${metrics.widthPixels}x${metrics.heightPixels}",
-                    )
+                    logCaptionWindowMode(window, fullscreen, requestedTextSize)
                 }
+                scheduleCaptionTextSizeRefresh(window)
 
                 if (fullscreen) {
-                    chain.proceed(arrayOf(requestedTextSize * FULLSCREEN_CAPTION_TEXT_SCALE))
+                    chain.proceed(arrayOf(appliedTextSize))
                 } else {
                     chain.proceed()
                 }
@@ -401,11 +443,159 @@ object CaptionHook : BaseHook {
         return methods.isNotEmpty()
     }
 
-    private fun View.isFullscreenCaptionWindow(): Boolean {
-        val overlay = parent as? View ?: return false
+    private fun rememberCaptionTextSize(
+        window: View,
+        method: Method,
+        rawTextSize: Float,
+        appliedTextSize: Float,
+        fullscreen: Boolean,
+    ): Boolean? = synchronized(captionTextSizeStates) {
+        val state = captionTextSizeStates[window]
+        val previousFullscreen = state?.fullscreen
+        if (state == null) {
+            captionTextSizeStates[window] = CaptionTextSizeState(
+                method = method,
+                rawTextSize = rawTextSize,
+                appliedTextSize = appliedTextSize,
+                fullscreen = fullscreen,
+            )
+        } else {
+            state.method = method
+            state.rawTextSize = rawTextSize
+            state.appliedTextSize = appliedTextSize
+            state.fullscreen = fullscreen
+        }
+        previousFullscreen
+    }
+
+    private fun scheduleCaptionTextSizeRefresh(window: View) {
+        val shouldPost = synchronized(captionTextSizeStates) {
+            val state = captionTextSizeStates[window] ?: return
+            if (state.refreshPosted) {
+                false
+            } else {
+                state.refreshPosted = true
+                true
+            }
+        }
+        if (!shouldPost) return
+
+        mainHandler.post {
+            synchronized(captionTextSizeStates) {
+                captionTextSizeStates[window]?.refreshPosted = false
+            }
+            bindCaptionTextSizeListeners(window)
+            refreshCaptionTextSize(window)
+        }
+    }
+
+    private fun bindCaptionTextSizeListeners(window: View) {
+        val state = synchronized(captionTextSizeStates) {
+            captionTextSizeStates[window]
+        } ?: return
+
+        if (state.attachListener == null) {
+            val listener = object : View.OnAttachStateChangeListener {
+                override fun onViewAttachedToWindow(view: View) {
+                    scheduleCaptionTextSizeRefresh(view)
+                }
+
+                override fun onViewDetachedFromWindow(view: View) {
+                    unbindCaptionTextSizeParent(view)
+                }
+            }
+            state.attachListener = listener
+            window.addOnAttachStateChangeListener(listener)
+        }
+
+        val parent = window.parent as? View
+        val previousParent = state.parent?.get()
+        if (previousParent === parent) return
+
+        previousParent?.let { oldParent ->
+            state.parentLayoutListener?.let(oldParent::removeOnLayoutChangeListener)
+        }
+        state.parent = parent?.let(::WeakReference)
+        state.parentLayoutListener = parent?.let {
+            val windowReference = WeakReference(window)
+            View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
+                windowReference.get()?.let(::scheduleCaptionTextSizeRefresh)
+            }.also(it::addOnLayoutChangeListener)
+        }
+    }
+
+    private fun unbindCaptionTextSizeParent(window: View) {
+        val state = synchronized(captionTextSizeStates) {
+            captionTextSizeStates[window]
+        } ?: return
+        state.parent?.get()?.let { parent ->
+            state.parentLayoutListener?.let(parent::removeOnLayoutChangeListener)
+        }
+        state.parent = null
+        state.parentLayoutListener = null
+    }
+
+    private fun refreshCaptionTextSize(window: View) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            scheduleCaptionTextSizeRefresh(window)
+            return
+        }
+        val fullscreenState = window.fullscreenCaptionWindowState() ?: return
+        val state = synchronized(captionTextSizeStates) {
+            captionTextSizeStates[window]
+        } ?: return
+        val fullscreen = module.config.enabled && fullscreenState
+        val appliedTextSize = if (fullscreen) {
+            state.rawTextSize * FULLSCREEN_CAPTION_TEXT_SCALE
+        } else {
+            state.rawTextSize
+        }
+        if (state.fullscreen == fullscreen &&
+            kotlin.math.abs(state.appliedTextSize - appliedTextSize) < CAPTION_TEXT_SIZE_EPSILON
+        ) {
+            return
+        }
+
+        state.fullscreen = fullscreen
+        state.appliedTextSize = appliedTextSize
+        logCaptionWindowMode(window, fullscreen, state.rawTextSize)
+        try {
+            reapplyingCaptionTextSize.set(true)
+            state.method.invoke(window, appliedTextSize)
+        } catch (e: Throwable) {
+            logW(name, "Unable to refresh caption text size", e)
+        } finally {
+            reapplyingCaptionTextSize.set(false)
+        }
+    }
+
+    private fun refreshAllCaptionTextSizes() {
+        val windows = synchronized(captionTextSizeStates) {
+            captionTextSizeStates.keys.toList()
+        }
+        windows.forEach(::scheduleCaptionTextSizeRefresh)
+    }
+
+    private fun logCaptionWindowMode(window: View, fullscreen: Boolean, rawTextSize: Float) {
+        val overlay = window.parent as? View
+        val root = overlay?.rootView
+        val metrics = window.resources.displayMetrics
+        logV(
+            name,
+            "Caption window mode changed, fullscreen=$fullscreen, " +
+                    "textSize=$rawTextSize, owner=${window.javaClass.simpleName}, " +
+                    "overlay=${overlay?.measuredWidth}x${overlay?.measuredHeight}, " +
+                    "root=${root?.measuredWidth}x${root?.measuredHeight}, " +
+                    "display=${metrics.widthPixels}x${metrics.heightPixels}",
+        )
+    }
+
+    private fun View.fullscreenCaptionWindowState(): Boolean? {
+        val overlay = parent as? View ?: return null
         val overlayWidth = overlay.measuredWidth.takeIf { it > 0 } ?: overlay.width
         val overlayHeight = overlay.measuredHeight.takeIf { it > 0 } ?: overlay.height
-        if (overlayWidth <= 0 || overlayHeight <= 0) return false
+        if (overlayWidth <= 0 || overlayHeight <= 0) return null
+        if (context.activityOrNull()?.isInPictureInPictureMode == true) return false
 
         val root = overlay.rootView
         val metrics = resources.displayMetrics
@@ -426,6 +616,15 @@ object CaptionHook : BaseHook {
         return coversRoot || covers(metrics.widthPixels, metrics.heightPixels)
     }
 
+    private fun Context.activityOrNull(): Activity? {
+        var current: Context? = this
+        while (current != null) {
+            if (current is Activity) return current
+            current = (current as? ContextWrapper)?.baseContext
+        }
+        return null
+    }
+
     private fun installCaptionEventHook(dexkit: DexKitBridge): Boolean {
         val webVttDecoder = dexkit.findWebVttDecoderMethod() ?: run {
             logW(name, "Caption event decoder not found")
@@ -438,8 +637,11 @@ object CaptionHook : BaseHook {
         }
 
         hook(constructor) { chain ->
+            val expectedTrackEpoch = captionTrackEpoch.get()
             val result = chain.proceed()
-            observeCaptionEventAccumulator(chain.getArg(0))
+            if (module.config.enabled && expectedTrackEpoch == captionTrackEpoch.get()) {
+                observeCaptionEventAccumulator(chain.getArg(0), expectedTrackEpoch)
+            }
             result
         }
 
@@ -447,9 +649,10 @@ object CaptionHook : BaseHook {
         return true
     }
 
-    private fun observeTimeline(result: Any?): List<CaptionCue> {
+    private fun observeTimeline(result: Any?, expectedTrackEpoch: Long): List<CaptionCue> {
+        if (expectedTrackEpoch != captionTrackEpoch.get()) return emptyList()
         if (result == null) {
-            clearCaptionTimeline()
+            clearCaptionTimeline(expectedTrackEpoch)
             return emptyList()
         }
 
@@ -469,12 +672,12 @@ object CaptionHook : BaseHook {
             .filterIsInstance<List<*>>()
             .filter { it.isNotEmpty() }
         val texts = lists.firstOrNull { list -> list.any { it is CharSequence } } ?: run {
-            clearCaptionTimeline()
+            clearCaptionTimeline(expectedTrackEpoch)
             return emptyList()
         }
         val timeLists = lists.filter { list -> list.all { it is Number } }
         if (timeLists.size < 2) {
-            clearCaptionTimeline()
+            clearCaptionTimeline(expectedTrackEpoch)
             return emptyList()
         }
 
@@ -482,7 +685,7 @@ object CaptionHook : BaseHook {
 
         val size = minOf(starts.size, ends.size, texts.size)
         if (size == 0) {
-            clearCaptionTimeline()
+            clearCaptionTimeline(expectedTrackEpoch)
             return emptyList()
         }
 
@@ -511,8 +714,15 @@ object CaptionHook : BaseHook {
             size = size,
             textUnwrapper = timelineTextUnwrapper,
             useFullTextPrefixGuard = useFullTextPrefixGuard,
+            expectedTrackEpoch = expectedTrackEpoch,
         )
-        return session.observeNewCues(cues)
+        return synchronized(captionStateLock) {
+            if (expectedTrackEpoch != captionTrackEpoch.get()) {
+                emptyList()
+            } else {
+                session.observeNewCues(cues)
+            }
+        }
     }
 
     private fun observeTimelineWindowBatch(
@@ -522,6 +732,7 @@ object CaptionHook : BaseHook {
         size: Int,
         textUnwrapper: Method?,
         useFullTextPrefixGuard: Boolean,
+        expectedTrackEpoch: Long,
     ) {
         val lines = ArrayList<TimelineLine>(size)
         for (index in 0 until size) {
@@ -543,6 +754,7 @@ object CaptionHook : BaseHook {
             rawWindows
         }
         val (stored, generation) = synchronized(captionStateLock) {
+            if (expectedTrackEpoch != captionTrackEpoch.get()) return
             captionTimelineIsRolling = isRolling
             val count = session.replaceCaptionTimeline(
                 windows.map { window -> window.startMs to window.text },
@@ -722,8 +934,9 @@ object CaptionHook : BaseHook {
         return closest
     }
 
-    private fun clearCaptionTimeline() {
+    private fun clearCaptionTimeline(expectedTrackEpoch: Long) {
         val cleared = synchronized(captionStateLock) {
+            if (expectedTrackEpoch != captionTrackEpoch.get()) return
             captionTimelineIsRolling = false
             val count = session.replaceCaptionTimeline(emptyList())
             if (count >= 0) captionGeneration.incrementAndGet()
@@ -905,7 +1118,8 @@ object CaptionHook : BaseHook {
         }
     }
 
-    private fun observeCaptionEventAccumulator(arg: Any?) {
+    private fun observeCaptionEventAccumulator(arg: Any?, expectedTrackEpoch: Long) {
+        if (expectedTrackEpoch != captionTrackEpoch.get()) return
         if (arg == null) return
         val listFields = captionAccumulatorEventListFields.getOrPut(arg.javaClass) {
             arg.instanceFields().filter { field ->
@@ -924,10 +1138,11 @@ object CaptionHook : BaseHook {
             }
             return
         }
-        observeCaptionEventBatch(events)
+        observeCaptionEventBatch(events, expectedTrackEpoch)
     }
 
-    private fun observeCaptionEventBatch(arg: Any?) {
+    private fun observeCaptionEventBatch(arg: Any?, expectedTrackEpoch: Long) {
+        if (expectedTrackEpoch != captionTrackEpoch.get()) return
         val events = arg as? List<*> ?: return
         if (events.isEmpty()) return
 
@@ -954,7 +1169,10 @@ object CaptionHook : BaseHook {
             }
         }
 
-        val stored = session.observeCaptionEventBatch(texts)
+        val stored = synchronized(captionStateLock) {
+            if (expectedTrackEpoch != captionTrackEpoch.get()) return
+            session.observeCaptionEventBatch(texts)
+        }
         if (stored > 0) {
             logV(
                 name,
@@ -1182,6 +1400,7 @@ object CaptionHook : BaseHook {
         val sourceLanguage = CaptionLanguageState.currentSourceLanguage()
         val provider = module.config.provider
         val targetLanguage = module.config.targetLanguage
+        val trackEpoch = captionTrackEpoch.get()
         val generation = synchronized(captionStateLock) {
             captionGeneration.get().also { currentGeneration ->
                 if (expectedGeneration != null && expectedGeneration != currentGeneration) return 0
@@ -1195,6 +1414,7 @@ object CaptionHook : BaseHook {
             mainHandler.post {
                 val accepted = synchronized(captionStateLock) {
                     if (!module.config.enabled ||
+                        trackEpoch != captionTrackEpoch.get() ||
                         generation != captionGeneration.get() ||
                         provider != module.config.provider ||
                         sourceLanguage != CaptionLanguageState.currentSourceLanguage() ||
@@ -1226,6 +1446,7 @@ object CaptionHook : BaseHook {
         if (!CaptionLanguageState.updateFromCaptionTrack(track, source)) return
 
         synchronized(captionStateLock) {
+            captionTrackEpoch.incrementAndGet()
             captionGeneration.incrementAndGet()
             captionTimelineIsRolling = false
             session.clear()
@@ -1233,6 +1454,9 @@ object CaptionHook : BaseHook {
         restoreAllBilingualCaptionOffsets()
         synchronized(captionWindows) {
             captionWindows.clear()
+        }
+        synchronized(nativeCaptionWindowUpdates) {
+            nativeCaptionWindowUpdates.clear()
         }
         synchronized(rendererStates) {
             rendererStates.clear()
@@ -1242,6 +1466,27 @@ object CaptionHook : BaseHook {
         }
         captionPrefetchMisses.clear()
         rendererSequence.set(0L)
+    }
+
+    private fun rememberNativeCaptionWindowUpdate(owner: Any?, argument: Any, method: Method) {
+        if (owner == null) return
+        method.isAccessible = true
+        synchronized(nativeCaptionWindowUpdates) {
+            nativeCaptionWindowUpdates[owner] = NativeCaptionWindowUpdate(method, argument)
+        }
+    }
+
+    private fun replayNativeCaptionWindowUpdates() {
+        val updates = synchronized(nativeCaptionWindowUpdates) {
+            nativeCaptionWindowUpdates.entries.map { (owner, update) -> owner to update }
+        }
+        for ((owner, update) in updates) {
+            runCatching {
+                update.method.invoke(owner, update.argument)
+            }.onFailure { error ->
+                logW(name, "Unable to replay native caption window", error)
+            }
+        }
     }
 
     private fun rememberRendererState(
@@ -1513,6 +1758,20 @@ object CaptionHook : BaseHook {
             bilingualCaptionOffsets.remove(parent)
         } ?: return
 
+        restoreBilingualCaptionOffsets(parent, offsets)
+    }
+
+    private fun restoreBilingualCaptionOffsets(
+        parent: ViewGroup,
+        offsets: BilingualCaptionOffsets,
+    ) {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post {
+                restoreBilingualCaptionOffsets(parent, offsets)
+            }
+            return
+        }
+
         val first = offsets.first.get()
         if (first != null && first.translationY == offsets.appliedFirstTranslationY) {
             first.translationY = offsets.firstTranslationY
@@ -1537,10 +1796,14 @@ object CaptionHook : BaseHook {
     }
 
     private fun restoreAllBilingualCaptionOffsets() {
-        val parents = synchronized(bilingualCaptionOffsets) {
-            bilingualCaptionOffsets.keys.toList()
+        val offsets = synchronized(bilingualCaptionOffsets) {
+            bilingualCaptionOffsets.entries
+                .map { (parent, value) -> parent to value }
+                .also { bilingualCaptionOffsets.clear() }
         }
-        parents.forEach { parent -> restoreBilingualCaptionOffsets(parent) }
+        offsets.forEach { (parent, value) ->
+            restoreBilingualCaptionOffsets(parent, value)
+        }
     }
 
     private fun refreshVisibleRenderers(original: String, source: String) {
@@ -1787,6 +2050,7 @@ object CaptionHook : BaseHook {
     private const val FULLSCREEN_CAPTION_TEXT_SCALE = 0.7f
     private const val FULLSCREEN_CAPTION_MIN_MAIN_COVERAGE = 0.9f
     private const val FULLSCREEN_CAPTION_MIN_CROSS_COVERAGE = 0.5f
+    private const val CAPTION_TEXT_SIZE_EPSILON = 0.01f
     private val sentenceBoundary = Regex("[.!?。！？…]+[\\\"'”’）)\\]]*(?=\\s|$)")
     private val clauseBoundary = Regex("[,;:，；：]+[\\\"'”’）)\\]]*(?=\\s|$)")
 
@@ -1819,6 +2083,22 @@ object CaptionHook : BaseHook {
         val displayText: String,
         val isRolling: Boolean,
         val isTimelineGrouped: Boolean,
+    )
+
+    private data class NativeCaptionWindowUpdate(
+        val method: Method,
+        val argument: Any,
+    )
+
+    private data class CaptionTextSizeState(
+        var method: Method,
+        var rawTextSize: Float,
+        var appliedTextSize: Float,
+        var fullscreen: Boolean,
+        var refreshPosted: Boolean = false,
+        var parent: WeakReference<View>? = null,
+        var parentLayoutListener: View.OnLayoutChangeListener? = null,
+        var attachListener: View.OnAttachStateChangeListener? = null,
     )
 
     private data class BilingualCaptionOffsets(

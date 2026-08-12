@@ -17,8 +17,13 @@ object TranslationManager {
     const val MIN_TIMEOUT_MS = 5_000
     const val BASE_RETRY_DELAY_MS = 750L
 
-    private val inFlight = ConcurrentHashMap.newKeySet<String>()
+    private val inFlight = ConcurrentHashMap.newKeySet<RequestKey>()
     private val executor = Executors.newFixedThreadPool(4, ThreadFactory)
+    private val settingsRevision = AtomicInteger(0)
+
+    fun onSettingsChanged() {
+        settingsRevision.incrementAndGet()
+    }
 
     fun translateAsync(
         text: String,
@@ -139,6 +144,7 @@ object TranslationManager {
             targetLanguage = identity.targetLanguage,
             context = context,
             timeoutMs = timeoutMs,
+            providerSettings = identity.providerSettings,
         )
         val translations = translator(identity.provider).translate(request).texts
         check(translations.size == texts.size) {
@@ -169,15 +175,21 @@ object TranslationManager {
             provider = module.config.provider,
             sourceLanguage = normalizedSourceLanguage(sourceLanguage),
             targetLanguage = module.config.targetLanguage,
+            settingsRevision = settingsRevision.get(),
+            providerSettings = TranslationProviderSettings(
+                microsoftEndpoint = module.config.microsoftEndpoint,
+                microsoftApiKey = module.config.microsoftApiKey,
+                microsoftRegion = module.config.microsoftRegion,
+                openAiEndpoint = module.config.openAiEndpoint,
+                openAiApiKey = module.config.openAiApiKey,
+                openAiModel = module.config.openAiModel,
+                openAiSystemPrompt = module.config.openAiSystemPrompt,
+                openAiUserPrompt = module.config.openAiUserPrompt,
+            ),
         )
 
-    private fun requestKey(text: String, identity: RequestIdentity): String =
-        listOf(
-            identity.provider,
-            identity.sourceLanguage,
-            identity.targetLanguage,
-            text,
-        ).joinToString(separator = "\n")
+    private fun requestKey(text: String, identity: RequestIdentity): RequestKey =
+        RequestKey(text, identity)
 
     private fun normalizedSourceLanguage(language: String): String =
         language.trim().ifEmpty { "auto" }
@@ -186,6 +198,13 @@ object TranslationManager {
         val provider: String,
         val sourceLanguage: String,
         val targetLanguage: String,
+        val settingsRevision: Int,
+        val providerSettings: TranslationProviderSettings,
+    )
+
+    private data class RequestKey(
+        val text: String,
+        val identity: RequestIdentity,
     )
 
     private data class RequestSettings(

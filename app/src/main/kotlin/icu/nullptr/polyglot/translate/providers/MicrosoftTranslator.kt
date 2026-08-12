@@ -3,7 +3,6 @@ package icu.nullptr.polyglot.translate.providers
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
-import icu.nullptr.polyglot.module
 import icu.nullptr.polyglot.translate.TranslationRequest
 import icu.nullptr.polyglot.translate.TranslationResult
 import icu.nullptr.polyglot.translate.Translator
@@ -21,7 +20,7 @@ object MicrosoftTranslator : Translator {
         try {
             translateWithEdge(request)
         } catch (edgeError: Exception) {
-            if (module.config.microsoftApiKey.isBlank()) {
+            if (request.providerSettings.microsoftApiKey.isBlank()) {
                 throw IllegalStateException("Microsoft Edge translate failed", edgeError)
             }
 
@@ -78,7 +77,8 @@ object MicrosoftTranslator : Translator {
             append("&to=").append(urlEncode(targetLanguage))
             append("&textType=plain")
         }
-        val endpoint = azureTranslateEndpoint(module.config.microsoftEndpoint)
+        val settings = request.providerSettings
+        val endpoint = azureTranslateEndpoint(settings.microsoftEndpoint)
         val separator = if ('?' in endpoint) '&' else '?'
         val connection = URL("$endpoint$separator$query").openConnection() as HttpURLConnection
         connection.requestMethod = "POST"
@@ -87,8 +87,8 @@ object MicrosoftTranslator : Translator {
         connection.readTimeout = request.timeoutMs
         connection.setRequestProperty("Accept", "application/json")
         connection.setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-        connection.setRequestProperty("Ocp-Apim-Subscription-Key", module.config.microsoftApiKey)
-        module.config.microsoftRegion.takeIf { it.isNotBlank() }?.let { region ->
+        connection.setRequestProperty("Ocp-Apim-Subscription-Key", settings.microsoftApiKey)
+        settings.microsoftRegion.takeIf { it.isNotBlank() }?.let { region ->
             connection.setRequestProperty("Ocp-Apim-Subscription-Region", region)
         }
 

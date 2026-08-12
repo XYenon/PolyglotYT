@@ -52,7 +52,10 @@ internal object PolyglotSettingsTree {
                     inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI,
                     value = { module.config.microsoftEndpoint },
                     summary = { SettingsOptions.textOrNotSet(module.config.microsoftEndpoint) },
-                    onSubmitted = { module.config.microsoftEndpoint = it.trim() },
+                    onSubmitted = { endpoint ->
+                        module.config.microsoftEndpoint = endpoint.trim()
+                        CaptionHook.onTranslationSettingsChanged()
+                    },
                 ),
                 TextSettingsNode(
                     key = "$ENTRY_KEY.microsoft_api_key",
@@ -64,7 +67,10 @@ internal object PolyglotSettingsTree {
                         InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS,
                     value = { module.config.microsoftApiKey },
                     summary = { SettingsOptions.secretSummary(module.config.microsoftApiKey) },
-                    onSubmitted = { module.config.microsoftApiKey = it.trim() },
+                    onSubmitted = { apiKey ->
+                        module.config.microsoftApiKey = apiKey.trim()
+                        CaptionHook.onTranslationSettingsChanged()
+                    },
                 ),
                 TextSettingsNode(
                     key = "$ENTRY_KEY.microsoft_region",
@@ -74,7 +80,10 @@ internal object PolyglotSettingsTree {
                     inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS,
                     value = { module.config.microsoftRegion },
                     summary = { SettingsOptions.textOrNotSet(module.config.microsoftRegion) },
-                    onSubmitted = { module.config.microsoftRegion = it.trim() },
+                    onSubmitted = { region ->
+                        module.config.microsoftRegion = region.trim()
+                        CaptionHook.onTranslationSettingsChanged()
+                    },
                 ),
                 TextSettingsNode(
                     key = "$ENTRY_KEY.openai_endpoint",
@@ -84,7 +93,10 @@ internal object PolyglotSettingsTree {
                     inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI,
                     value = { module.config.openAiEndpoint },
                     summary = { SettingsOptions.textOrNotSet(module.config.openAiEndpoint) },
-                    onSubmitted = { module.config.openAiEndpoint = it.trim() },
+                    onSubmitted = { endpoint ->
+                        module.config.openAiEndpoint = endpoint.trim()
+                        CaptionHook.onTranslationSettingsChanged()
+                    },
                 ),
                 TextSettingsNode(
                     key = "$ENTRY_KEY.openai_api_key",
@@ -96,7 +108,10 @@ internal object PolyglotSettingsTree {
                         InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS,
                     value = { module.config.openAiApiKey },
                     summary = { SettingsOptions.secretSummary(module.config.openAiApiKey) },
-                    onSubmitted = { module.config.openAiApiKey = it.trim() },
+                    onSubmitted = { apiKey ->
+                        module.config.openAiApiKey = apiKey.trim()
+                        CaptionHook.onTranslationSettingsChanged()
+                    },
                 ),
                 TextSettingsNode(
                     key = "$ENTRY_KEY.openai_model",
@@ -106,7 +121,10 @@ internal object PolyglotSettingsTree {
                     inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS,
                     value = { module.config.openAiModel },
                     summary = { SettingsOptions.textOrNotSet(module.config.openAiModel) },
-                    onSubmitted = { module.config.openAiModel = it.trim() },
+                    onSubmitted = { model ->
+                        module.config.openAiModel = model.trim()
+                        CaptionHook.onTranslationSettingsChanged()
+                    },
                 ),
                 SelectionSettingsNode(
                     key = "$ENTRY_KEY.target_language",
@@ -127,7 +145,10 @@ internal object PolyglotSettingsTree {
                     options = SettingsOptions.subtitleMode,
                     selectedValue = { module.config.subtitleMode },
                     selectedLabel = { SettingsOptions.subtitleModeLabel(module.config.subtitleMode) },
-                    onSelected = { module.config.subtitleMode = it },
+                    onSelected = { subtitleMode ->
+                        module.config.subtitleMode = subtitleMode
+                        CaptionHook.onSubtitleModeChanged()
+                    },
                 ),
             ),
         )

@@ -3,7 +3,6 @@ package icu.nullptr.polyglot.translate.providers
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
-import icu.nullptr.polyglot.module
 import icu.nullptr.polyglot.translate.TranslationRequest
 import icu.nullptr.polyglot.translate.TranslationResult
 import icu.nullptr.polyglot.translate.Translator
@@ -41,17 +40,25 @@ object OpenAICompatibleTranslator : Translator {
 
     private fun translateBatch(texts: List<String>, request: TranslationRequest): List<String> {
         val input = JsonArray().apply {
-            texts.forEach { text -> add(text) }
+            texts.forEachIndexed { index, text ->
+                add(
+                    JsonObject().apply {
+                        addProperty("id", index)
+                        addProperty("text", text)
+                    },
+                )
+            }
         }.toString()
         val response = request(input, request, batch = true)
         return parseBatchTranslations(response, texts.size)
     }
 
     private fun request(text: String, request: TranslationRequest, batch: Boolean): String {
-        val apiKey = module.config.openAiApiKey
+        val settings = request.providerSettings
+        val apiKey = settings.openAiApiKey
         require(apiKey.isNotBlank()) { "OpenAI-compatible API key is not configured" }
 
-        val connection = URL(module.config.openAiEndpoint.ifBlank { DEFAULT_ENDPOINT })
+        val connection = URL(settings.openAiEndpoint.ifBlank { DEFAULT_ENDPOINT })
             .openConnection() as HttpURLConnection
         connection.requestMethod = "POST"
         connection.doOutput = true
@@ -74,8 +81,9 @@ object OpenAICompatibleTranslator : Translator {
         request: TranslationRequest,
         batch: Boolean,
     ): String {
-        val systemPrompt = module.config.openAiSystemPrompt
-        var userPrompt = module.config.openAiUserPrompt
+        val settings = request.providerSettings
+        val systemPrompt = settings.openAiSystemPrompt
+        var userPrompt = settings.openAiUserPrompt
             .replace("{{to}}", request.targetLanguage)
             .replace("{{origin}}", text)
         if (batch) {
@@ -98,7 +106,7 @@ object OpenAICompatibleTranslator : Translator {
         }
 
         return JsonObject().apply {
-            addProperty("model", module.config.openAiModel.ifBlank { DEFAULT_MODEL })
+            addProperty("model", settings.openAiModel.ifBlank { DEFAULT_MODEL })
             addProperty("temperature", 1.0)
             add("messages", messages)
         }.toString()
@@ -119,14 +127,39 @@ object OpenAICompatibleTranslator : Translator {
         check(arrayStart >= 0 && arrayEnd > arrayStart) {
             "OpenAI-compatible batch response contained no JSON array"
         }
-        val translations = JsonParser.parseString(content.substring(arrayStart, arrayEnd + 1))
+        val results = JsonParser.parseString(content.substring(arrayStart, arrayEnd + 1))
             .asJsonArray
-            .map { element -> element.asString }
-        check(translations.size == expectedCount) {
-            "OpenAI-compatible batch response returned ${translations.size} results " +
+        val translations = arrayOfNulls<String>(expectedCount)
+        for (result in results) {
+            check(result.isJsonObject) {
+                "OpenAI-compatible batch response contained a non-object result"
+            }
+            val resultObject = result.asJsonObject
+            val idValue = resultObject["id"]
+            val translationValue = resultObject["translation"]
+            val id = idValue
+                ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isNumber }
+                ?.asString
+                ?.toIntOrNull()
+            check(id != null && id in translations.indices) {
+                "OpenAI-compatible batch response contained an invalid result ID"
+            }
+            check(translations[id] == null) {
+                "OpenAI-compatible batch response contained duplicate result ID $id"
+            }
+            check(translationValue != null &&
+                    translationValue.isJsonPrimitive &&
+                    translationValue.asJsonPrimitive.isString
+            ) {
+                "OpenAI-compatible batch response contained no translation for ID $id"
+            }
+            translations[id] = translationValue.asString
+        }
+        check(translations.all { it != null }) {
+            "OpenAI-compatible batch response returned ${results.size()} results " +
                 "for $expectedCount texts"
         }
-        return translations
+        return translations.map { it!! }
     }
 
     private fun responseContent(body: String): String {
@@ -156,7 +189,8 @@ object OpenAICompatibleTranslator : Translator {
         }
 
     private const val BATCH_RESPONSE_INSTRUCTION =
-        "\n\nThe source above is a JSON array. Translate every element independently and " +
-            "return only a JSON array of translated strings in the same order. " +
-            "Do not add markdown, labels, explanations, or change the number of elements."
+        "\n\nThe source above is a JSON array of objects with id and text fields. " +
+            "Translate every text independently and return only a JSON array of objects with " +
+            "the same id and a translation string. Preserve every id exactly once. " +
+            "Do not add markdown, labels, or explanations."
 }
