@@ -790,7 +790,9 @@ object CaptionHook : BaseHook {
             captionWindows.put(owner, window)
         }
 
-        if (previous?.fullText == window.fullText) {
+        if (previous?.displayText == window.displayText &&
+            previous.isRolling == window.isRolling
+        ) {
             return emptyList()
         }
         restoreBilingualCaptionOffsets(owner)
