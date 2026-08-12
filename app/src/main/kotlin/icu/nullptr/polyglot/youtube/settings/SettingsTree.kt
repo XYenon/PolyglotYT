@@ -6,6 +6,7 @@ import icu.nullptr.polyglot.core.ConfigManager
 import icu.nullptr.polyglot.module
 import icu.nullptr.polyglot.settings.SettingsOption
 import icu.nullptr.polyglot.settings.SettingsOptions
+import icu.nullptr.polyglot.youtube.CaptionHook
 
 internal object PolyglotSettingsTree {
     fun root(): SettingsScreenNode =
@@ -19,7 +20,10 @@ internal object PolyglotSettingsTree {
                     icon = SettingsIcon.Enable,
                     checked = { module.config.enabled },
                     summary = { SettingsOptions.enabledSummary(module.config.enabled) },
-                    onChanged = { module.config.enabled = it },
+                    onChanged = { enabled ->
+                        module.config.enabled = enabled
+                        CaptionHook.onEnabledChanged(enabled)
+                    },
                 ),
                 ActionSettingsNode(
                     key = "$ENTRY_KEY.test_connectivity",
@@ -35,7 +39,10 @@ internal object PolyglotSettingsTree {
                     options = SettingsOptions.providers,
                     selectedValue = { module.config.provider },
                     selectedLabel = { SettingsOptions.providerLabel(module.config.provider) },
-                    onSelected = { module.config.provider = it },
+                    onSelected = { provider ->
+                        module.config.provider = provider
+                        CaptionHook.onTranslationSettingsChanged()
+                    },
                 ),
                 TextSettingsNode(
                     key = "$ENTRY_KEY.microsoft_endpoint",
@@ -108,7 +115,10 @@ internal object PolyglotSettingsTree {
                     options = SettingsOptions.targetLanguages,
                     selectedValue = { module.config.targetLanguage },
                     selectedLabel = { SettingsOptions.languageLabel(module.config.targetLanguage) },
-                    onSelected = { module.config.targetLanguage = it },
+                    onSelected = { targetLanguage ->
+                        module.config.targetLanguage = targetLanguage
+                        CaptionHook.onTranslationSettingsChanged()
+                    },
                 ),
                 SelectionSettingsNode(
                     key = "$ENTRY_KEY.subtitle_mode",

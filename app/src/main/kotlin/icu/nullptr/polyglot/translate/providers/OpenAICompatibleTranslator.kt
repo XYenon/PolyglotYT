@@ -15,14 +15,39 @@ object OpenAICompatibleTranslator : Translator {
     const val DEFAULT_MODEL = "gpt-4o-mini"
     val THINK_BLOCK = Regex("^<think>[\\s\\S]*?</think>")
 
-    override fun translate(request: TranslationRequest): TranslationResult =
-        TranslationResult(
+    override fun translate(request: TranslationRequest): TranslationResult {
+        val nonBlankTexts = request.texts.filter { text -> text.isNotBlank() }
+        if (nonBlankTexts.size <= 1) {
+            return TranslationResult(
+                texts = request.texts.map { text ->
+                    if (text.isBlank()) text else translateOne(text, request)
+                },
+            )
+        }
+
+        val translations = translateBatch(nonBlankTexts, request)
+        var translatedIndex = 0
+        return TranslationResult(
             texts = request.texts.map { text ->
-                if (text.isBlank()) text else translateOne(text, request)
+                if (text.isBlank()) text else translations[translatedIndex++]
             },
         )
+    }
 
     private fun translateOne(text: String, request: TranslationRequest): String {
+        val response = request(text, request, batch = false)
+        return parseTranslation(response)
+    }
+
+    private fun translateBatch(texts: List<String>, request: TranslationRequest): List<String> {
+        val input = JsonArray().apply {
+            texts.forEach { text -> add(text) }
+        }.toString()
+        val response = request(input, request, batch = true)
+        return parseBatchTranslations(response, texts.size)
+    }
+
+    private fun request(text: String, request: TranslationRequest, batch: Boolean): String {
         val apiKey = module.config.openAiApiKey
         require(apiKey.isNotBlank()) { "OpenAI-compatible API key is not configured" }
 
@@ -36,20 +61,26 @@ object OpenAICompatibleTranslator : Translator {
         connection.setRequestProperty("Content-Type", "application/json")
         connection.setRequestProperty("Authorization", "Bearer $apiKey")
 
-        val body = buildRequestBody(text, request)
+        val body = buildRequestBody(text, request, batch)
         connection.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
 
         return connection.use {
-            val response = it.readBodyOrThrow()
-            parseTranslation(response)
+            it.readBodyOrThrow()
         }
     }
 
-    private fun buildRequestBody(text: String, request: TranslationRequest): String {
+    private fun buildRequestBody(
+        text: String,
+        request: TranslationRequest,
+        batch: Boolean,
+    ): String {
         val systemPrompt = module.config.openAiSystemPrompt
-        val userPrompt = module.config.openAiUserPrompt
+        var userPrompt = module.config.openAiUserPrompt
             .replace("{{to}}", request.targetLanguage)
             .replace("{{origin}}", text)
+        if (batch) {
+            userPrompt += BATCH_RESPONSE_INSTRUCTION
+        }
 
         val messages = JsonArray().apply {
             add(
@@ -74,6 +105,31 @@ object OpenAICompatibleTranslator : Translator {
     }
 
     private fun parseTranslation(body: String): String {
+        return responseContent(body).trim()
+    }
+
+    private fun parseBatchTranslations(body: String, expectedCount: Int): List<String> {
+        val content = responseContent(body)
+            .removePrefix("```json")
+            .removePrefix("```")
+            .removeSuffix("```")
+            .trim()
+        val arrayStart = content.indexOf('[')
+        val arrayEnd = content.lastIndexOf(']')
+        check(arrayStart >= 0 && arrayEnd > arrayStart) {
+            "OpenAI-compatible batch response contained no JSON array"
+        }
+        val translations = JsonParser.parseString(content.substring(arrayStart, arrayEnd + 1))
+            .asJsonArray
+            .map { element -> element.asString }
+        check(translations.size == expectedCount) {
+            "OpenAI-compatible batch response returned ${translations.size} results " +
+                "for $expectedCount texts"
+        }
+        return translations
+    }
+
+    private fun responseContent(body: String): String {
         val content = JsonParser.parseString(body)
             .asJsonObject["choices"]
             .asJsonArray[0]
@@ -98,4 +154,9 @@ object OpenAICompatibleTranslator : Translator {
         } finally {
             disconnect()
         }
+
+    private const val BATCH_RESPONSE_INSTRUCTION =
+        "\n\nThe source above is a JSON array. Translate every element independently and " +
+            "return only a JSON array of translated strings in the same order. " +
+            "Do not add markdown, labels, explanations, or change the number of elements."
 }

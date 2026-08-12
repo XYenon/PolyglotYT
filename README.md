@@ -21,4 +21,4 @@ PolyglotYT is an Xposed module for the YouTube Android app. It provides an immer
 
 - Android: 9.0 and later, minimum SDK 28.
 - Xposed Framework: supporting libxposed API 101 and later.
-- YouTube: tested on version 21.31.525.
+- YouTube: versions 21.04.223 and 21.31.525.

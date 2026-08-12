@@ -16,25 +16,35 @@ object CaptionLanguageState {
     @Volatile
     private var sourceLanguage = AUTO_LANGUAGE
 
+    @Volatile
+    private var captionTrackIdentity: String? = null
+
     fun currentSourceLanguage(): String =
         sourceLanguage.ifBlank { AUTO_LANGUAGE }
 
+    @Synchronized
     fun updateFromCaptionTrack(track: Any?, source: String): Boolean {
         val info = CaptionTrackInfo.from(track) ?: return false
         if (info.isPseudoOption) return false
 
         val language = info.languageCode ?: return false
-        val previous = sourceLanguage
-        if (previous == language) return false
+        val previousLanguage = sourceLanguage
+        val previousIdentity = captionTrackIdentity
+        if (previousLanguage == language && previousIdentity == info.identity) return false
 
         sourceLanguage = language
-        logD(TAG, "Detected YouTube caption language: $previous -> $language from $source")
+        captionTrackIdentity = info.identity
+        logD(
+            TAG,
+            "Detected YouTube caption track change: language=$previousLanguage -> $language from $source",
+        )
         return true
     }
 
     private data class CaptionTrackInfo(
         val languageCode: String?,
         val isPseudoOption: Boolean,
+        val identity: String,
     ) {
         companion object {
             fun from(track: Any?): CaptionTrackInfo? {
@@ -52,6 +62,13 @@ object CaptionLanguageState {
                 return CaptionTrackInfo(
                     languageCode = directLanguage ?: vssLanguage,
                     isPseudoOption = isPseudoOption,
+                    identity = buildString {
+                        append(track.javaClass.name)
+                        strings.forEach { value ->
+                            append('\u0000')
+                            append(value)
+                        }
+                    },
                 )
             }
         }

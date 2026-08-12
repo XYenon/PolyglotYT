@@ -94,7 +94,9 @@ object PlayerControlsHook : BaseHook {
         copyButtonVisuals(subtitleButton, button)
         button.setImageDrawable(module.res.getDrawable(R.drawable.outline_translate_24, null))
         button.setOnClickListener {
-            module.config.enabled = !module.config.enabled
+            val enabled = !module.config.enabled
+            module.config.enabled = enabled
+            CaptionHook.onEnabledChanged(enabled)
             syncTranslateButtonState(subtitleButton, button)
             Toast.makeText(context, translateContentDescription(), Toast.LENGTH_SHORT).show()
             logD(name, "Player translate button changed: enabled=${module.config.enabled}")
