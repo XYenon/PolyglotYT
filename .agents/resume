@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Fast reconnect for a resumed orb. Do not install toolchains here.
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+android_sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
+
+java_home=""
+for candidate in \
+  "${JAVA_HOME:-}" \
+  /usr/lib/jvm/temurin-21-jdk-amd64 \
+  /usr/lib/jvm/temurin-21-jdk*; do
+  if [[ -n "$candidate" && -x "${candidate}/bin/java" ]]; then
+    java_home="$candidate"
+    break
+  fi
+done
+
+if [[ -z "$java_home" ]]; then
+  echo "JDK 21 is missing. Re-run .agents/setup or start a fresh orb." >&2
+  exit 1
+fi
+
+if [[ ! -x "${android_sdk}/cmdline-tools/latest/bin/sdkmanager" ]]; then
+  echo "Android SDK is missing at ${android_sdk}. Re-run .agents/setup or start a fresh orb." >&2
+  exit 1
+fi
+
+export JAVA_HOME="$java_home"
+export ANDROID_HOME="$android_sdk"
+export ANDROID_SDK_ROOT="$android_sdk"
+export PATH="${java_home}/bin:${android_sdk}/cmdline-tools/latest/bin:${android_sdk}/platform-tools:${PATH}"
+
+if [[ ! -f local.properties ]] || ! grep -q '^sdk.dir=' local.properties; then
+  printf 'sdk.dir=%s\n' "$android_sdk" >local.properties
+  echo "wrote local.properties"
+else
+  echo "local.properties present"
+fi
+
+chmod +x ./gradlew
+
+echo "resume ok: JAVA_HOME=${JAVA_HOME} ANDROID_HOME=${ANDROID_HOME}"
