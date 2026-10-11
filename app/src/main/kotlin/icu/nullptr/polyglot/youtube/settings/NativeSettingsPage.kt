@@ -12,6 +12,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.Toast
 import android.window.OnBackInvokedCallback
+import android.window.OnBackInvokedDispatcher
 import icu.nullptr.polyglot.R
 import icu.nullptr.polyglot.module
 import icu.nullptr.polyglot.translate.ConnectivityTestResult
@@ -63,8 +64,12 @@ internal class NativeSettingsPage(
         return shown
     }
 
-    fun refreshSummaries() {
+    fun refreshSummaries(refreshVisibility: Boolean = true) {
         val screen = currentScreen ?: return
+        if (refreshVisibility && screen.node.children.filter { it.visible() }.map { it.key } != screen.rows.map { it.node.key }) {
+            renderScreen(screen.node)?.let { navigateTo(it, pushCurrent = false) }
+            return
+        }
         for (row in screen.rows) {
             val summary = row.node.summary() ?: continue
             adapter.setSummary(row.preference, summary)
@@ -95,7 +100,7 @@ internal class NativeSettingsPage(
         val shown = adapter.showPreferenceScreen(fragment, screen.screen)
         if (shown) {
             toolbarTitle.show(screen.node.title)
-            refreshSummaries()
+            refreshSummaries(refreshVisibility = false)
         }
         return shown
     }
@@ -181,7 +186,19 @@ internal class NativeSettingsPage(
                     true
                 }
             }
-            is SettingsScreenNode -> null
+            is SettingsScreenNode -> adapter.createPreference(
+                context = context,
+                classes = classes,
+                key = node.key,
+                title = node.title,
+                icon = node.icon,
+                summary = null,
+            ).also { preference ->
+                controller.registerClickHandler(preference) {
+                    renderScreen(node)?.let { navigateTo(it, pushCurrent = true) }
+                    true
+                }
+            }
         }
 
     private fun openSelectionDialog(node: SelectionSettingsNode) {
@@ -194,7 +211,7 @@ internal class NativeSettingsPage(
                 val option = node.options.getOrNull(which) ?: return@setSingleChoiceItems
                 if (option.value != node.selectedValue()) {
                     node.onSelected(option.value)
-                    rebuildRootScreen()
+                    rebuildCurrentScreen()
                 } else {
                     refreshSummaries()
                 }
@@ -208,7 +225,9 @@ internal class NativeSettingsPage(
         val dialogContext = dialogContext()
         val input = EditText(dialogContext).apply {
             inputType = node.inputType
-            setSingleLine(true)
+            val multiline = node.inputType and android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE != 0
+            setSingleLine(!multiline)
+            if (multiline) { minLines = 4; maxLines = 12 }
             setText(node.value())
             setSelection(text?.length ?: 0)
         }
@@ -231,7 +250,7 @@ internal class NativeSettingsPage(
             .setView(container)
             .setPositiveButton(android.R.string.ok) { _, _ ->
                 node.onSubmitted(input.text?.toString().orEmpty())
-                rebuildRootScreen()
+                rebuildCurrentScreen()
             }
             .setNegativeButton(android.R.string.cancel, null)
             .show()
@@ -300,15 +319,9 @@ internal class NativeSettingsPage(
                 else text.take(MAX_CONNECTIVITY_RESULT_LENGTH) + "..."
             }
 
-    private fun rebuildRootScreen() {
-        val screen = renderScreen(PolyglotSettingsTree.root()) ?: return
-        currentScreen = screen
-        backStack.clear()
-
-        if (adapter.showPreferenceScreen(fragment, screen.screen)) {
-            toolbarTitle.show(screen.node.title)
-            refreshSummaries()
-        }
+    private fun rebuildCurrentScreen() {
+        val node = currentScreen?.node ?: return
+        renderScreen(node)?.let { navigateTo(it, pushCurrent = false) }
     }
 
     private fun dialogContext(): Context =
@@ -326,7 +339,7 @@ internal class NativeSettingsPage(
         val callback = OnBackInvokedCallback { navigateBack() }
 
         runCatching {
-            hostActivity.onBackInvokedDispatcher.registerOnBackInvokedCallback(BACK_CALLBACK_PRIORITY, callback)
+            hostActivity.onBackInvokedDispatcher.registerOnBackInvokedCallback(OnBackInvokedDispatcher.PRIORITY_OVERLAY, callback)
             systemBackCallback = callback
             logD(TAG, "Registered PolyglotYT native settings system back callback")
         }.onFailure { e ->

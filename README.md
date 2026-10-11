@@ -12,6 +12,7 @@ PolyglotYT is an Xposed module for the YouTube Android app. It provides an immer
 - Automatically detects the source language from the caption language selected in YouTube.
 - Adds a PolyglotYT configuration entry to YouTube settings.
 - Adds an immersive translation quick switch next to the player CC button.
+- Supports rule, statistical, and optional AI subtitle segmentation, time-based pretranslation, streaming AI translation, and persistent caching. See [subtitle processing and defaults](docs/subtitle-processing.md).
 - Supports the following translation services:
   - YouTube comment translation (Google)
   - Microsoft Edge translation (no key required; optional Azure F0 fallback)

@@ -33,6 +33,7 @@ class ModuleEntry : XposedModule() {
     lateinit var hostClassLoader: ClassLoader
     lateinit var config: ConfigManager
     lateinit var res: Resources
+    val translationCacheDirectory: java.io.File get() = fileManager.translationCacheDir
 
     private val hookInstalled = AtomicBoolean(false)
 

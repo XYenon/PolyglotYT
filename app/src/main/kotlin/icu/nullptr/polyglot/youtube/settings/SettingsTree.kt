@@ -150,7 +150,7 @@ internal object PolyglotSettingsTree {
                         CaptionHook.onSubtitleModeChanged()
                     },
                 ),
-            ),
+            ) + SubtitleSettings.screens(),
         )
 }
 

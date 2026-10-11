@@ -20,6 +20,7 @@ object MicrosoftTranslator : Translator {
         try {
             translateWithEdge(request)
         } catch (edgeError: Exception) {
+            request.cancellation.checkActive()
             if (request.providerSettings.microsoftApiKey.isBlank()) {
                 throw IllegalStateException("Microsoft Edge translate failed", edgeError)
             }
@@ -51,12 +52,14 @@ object MicrosoftTranslator : Translator {
         connection.setRequestProperty("Accept", "application/json")
         connection.setRequestProperty("Content-Type", "application/json")
 
-        connection.outputStream.use { stream ->
-            stream.write(buildEdgeRequestBody(nonBlankTexts).toByteArray(Charsets.UTF_8))
-        }
-
         val translations = connection.use {
-            parseTranslations(it.readBodyOrThrow("Microsoft Edge translate"))
+            request.cancellation.register(it)
+            try {
+                connection.outputStream.use { stream ->
+                    stream.write(buildEdgeRequestBody(nonBlankTexts).toByteArray(Charsets.UTF_8))
+                }
+                parseTranslations(it.readBodyOrThrow("Microsoft Edge translate"))
+            } finally { request.cancellation.unregister(it) }
         }
         return mergeTranslations(request.texts, translations, "Microsoft Edge translate")
     }
@@ -92,12 +95,14 @@ object MicrosoftTranslator : Translator {
             connection.setRequestProperty("Ocp-Apim-Subscription-Region", region)
         }
 
-        connection.outputStream.use { stream ->
-            stream.write(buildAzureRequestBody(nonBlankTexts).toByteArray(Charsets.UTF_8))
-        }
-
         val translations = connection.use {
-            parseTranslations(it.readBodyOrThrow("Microsoft Azure translate"))
+            request.cancellation.register(it)
+            try {
+                connection.outputStream.use { stream ->
+                    stream.write(buildAzureRequestBody(nonBlankTexts).toByteArray(Charsets.UTF_8))
+                }
+                parseTranslations(it.readBodyOrThrow("Microsoft Azure translate"))
+            } finally { request.cancellation.unregister(it) }
         }
         return mergeTranslations(request.texts, translations, "Microsoft Azure translate")
     }

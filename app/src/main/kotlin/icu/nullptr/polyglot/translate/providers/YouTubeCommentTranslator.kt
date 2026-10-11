@@ -98,13 +98,15 @@ object YouTubeCommentTranslator : Translator {
                 "(Linux; U; Android ${Build.VERSION.RELEASE}) gzip",
         )
 
-        connection.outputStream.use { stream ->
-            stream.write(buildRequestBody(text, request.targetLanguage).toByteArray(Charsets.UTF_8))
-        }
-
         return connection.use {
-            val body = it.readBodyOrThrow()
-            parseTranslation(body)
+            request.cancellation.register(it)
+            try {
+                connection.outputStream.use { stream ->
+                    stream.write(buildRequestBody(text, request.targetLanguage).toByteArray(Charsets.UTF_8))
+                }
+                val body = it.readBodyOrThrow()
+                parseTranslation(body)
+            } finally { request.cancellation.unregister(it) }
         }
     }
 

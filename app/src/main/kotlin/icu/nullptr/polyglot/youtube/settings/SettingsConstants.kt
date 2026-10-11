@@ -14,7 +14,6 @@ internal const val PREFERENCE_SUMMARY_PROVIDER_ERROR = "Preference already has a
 internal const val PREFERENCE_DUPLICATED_KEY_PREFIX = "Found duplicated key"
 
 internal const val PREFERENCE_TOP_ORDER = -1
-internal const val BACK_CALLBACK_PRIORITY = 1_000_001
 
 internal val MAIN_SETTINGS_RESOURCES = setOf(
     "settings_fragment",

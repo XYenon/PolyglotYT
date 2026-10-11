@@ -7,6 +7,13 @@ import java.util.concurrent.atomic.AtomicInteger
 
 class CaptionSession {
     private val translations = ConcurrentHashMap<String, String>()
+    private val draftTranslations = ConcurrentHashMap.newKeySet<String>()
+    fun hasFinalTranslation(original: String): Boolean = translations.containsKey(normalize(original)) && normalize(original) !in draftTranslations
+    fun putDraftTranslation(original: String, translated: String) {
+        val key = normalize(original)
+        translations[key] = translated
+        draftTranslations.add(key)
+    }
     private val observedCues = ConcurrentHashMap<String, CaptionCue>()
     private val renderedTexts = ConcurrentHashMap<String, Long>()
     private val captionEventBatches = ArrayDeque<CaptionEventBatch>()
@@ -23,10 +30,12 @@ class CaptionSession {
     fun putTranslation(original: String?, translated: String?) {
         if (original == null || translated == null) return
         translations[normalize(original)] = translated
+        draftTranslations.remove(normalize(original))
     }
 
     fun clearTranslations() {
         translations.clear()
+        draftTranslations.clear()
     }
 
     fun clear() {
