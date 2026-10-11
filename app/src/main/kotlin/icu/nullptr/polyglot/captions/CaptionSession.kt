@@ -74,19 +74,17 @@ class CaptionSession {
 
             var low = 0
             var high = captionTimeline.lastIndex
-            var floorIndex = -1
             while (low <= high) {
                 val middle = (low + high).ushr(1)
                 if (captionTimeline[middle].startMs <= startMs) {
-                    floorIndex = middle
                     low = middle + 1
                 } else {
                     high = middle - 1
                 }
             }
-            if (floorIndex < 0) return null
+            if (high < 0) return null
 
-            val floor = captionTimeline[floorIndex]
+            val floor = captionTimeline[high]
             return floor.text.takeIf {
                 startMs - floor.startMs <= MAX_TIMELINE_LOOKUP_GAP_MS
             }

@@ -51,7 +51,7 @@ object TranslationManager {
             .distinct()
             .mapNotNull { text ->
                 val key = requestKey(text, settings.identity)
-                (text to key).takeIf { inFlight.add(key) }
+                if (inFlight.add(key)) text to key else null
             }
         if (pending.isEmpty()) return 0
         val originals = pending.map { (text, _) -> text }

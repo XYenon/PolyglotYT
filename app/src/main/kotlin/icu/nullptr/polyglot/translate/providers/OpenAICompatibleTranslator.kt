@@ -113,7 +113,7 @@ object OpenAICompatibleTranslator : Translator {
     }
 
     private fun parseTranslation(body: String): String {
-        return responseContent(body).trim()
+        return responseContent(body)
     }
 
     private fun parseBatchTranslations(body: String, expectedCount: Int): List<String> {
@@ -155,11 +155,12 @@ object OpenAICompatibleTranslator : Translator {
             }
             translations[id] = translationValue.asString
         }
-        check(translations.all { it != null }) {
-            "OpenAI-compatible batch response returned ${results.size()} results " +
-                "for $expectedCount texts"
+        return translations.map { translation ->
+            checkNotNull(translation) {
+                "OpenAI-compatible batch response returned ${results.size()} results " +
+                    "for $expectedCount texts"
+            }
         }
-        return translations.map { it!! }
     }
 
     private fun responseContent(body: String): String {

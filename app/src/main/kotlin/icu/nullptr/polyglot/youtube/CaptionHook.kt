@@ -110,8 +110,7 @@ object CaptionHook : BaseHook {
 
             if (enabled) {
                 replayNativeCaptionWindowUpdates()
-                val activeWindows = activeCaptionWindows()
-                activeWindows.forEach { (owner, window) ->
+                activeCaptionWindows().forEach { (owner, window) ->
                     applyCachedTranslationToCaptionWindow(owner)
                     requestCaptionWindowTranslations(window, source = "enabled")
                 }
@@ -379,6 +378,13 @@ object CaptionHook : BaseHook {
     }
 
     private fun installCaptionBottomSpacingHooks(dexkit: DexKitBridge): Boolean {
+        val layoutParameterTypes = arrayOf(
+            Boolean::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType,
+        )
         val captionWindowClassNames = dexkit.findCaptionWindowClassNames()
         val methods = dexkit.findCaptionOverlayUpdateMethods(captionWindowClassNames)
             .mapNotNull { candidate ->
@@ -387,15 +393,8 @@ object CaptionHook : BaseHook {
                     ViewGroup::class.java.isAssignableFrom(clazz)
                 ) {
                     val layoutMethod = clazz.declaredMethods.firstOrNull { method ->
-                        method.name == "onLayout" && method.parameterTypes.contentEquals(
-                            arrayOf(
-                                Boolean::class.javaPrimitiveType,
-                                Int::class.javaPrimitiveType,
-                                Int::class.javaPrimitiveType,
-                                Int::class.javaPrimitiveType,
-                                Int::class.javaPrimitiveType,
-                            ),
-                        )
+                        method.name == "onLayout" &&
+                                method.parameterTypes.contentEquals(layoutParameterTypes)
                     }
                     if (layoutMethod != null) return@mapNotNull layoutMethod
                     clazz = clazz.superclass
@@ -529,10 +528,7 @@ object CaptionHook : BaseHook {
         val cues = ArrayList<CaptionCue>(size)
         for (index in 0 until size) {
             val text = texts[index] as? CharSequence ?: continue
-            val unwrappedText = timelineTextUnwrapper
-                ?.let { method -> runCatching { method.invoke(null, text) as? CharSequence }.getOrNull() }
-                ?: text
-            val normalized = CaptionCue.normalize(unwrappedText.toString())
+            val normalized = CaptionCue.normalize(text.unwrapTimelineText(timelineTextUnwrapper).toString())
             if (normalized.isEmpty()) continue
 
             cues.add(
@@ -562,6 +558,9 @@ object CaptionHook : BaseHook {
         }
     }
 
+    private fun CharSequence.unwrapTimelineText(method: Method?): CharSequence =
+        method?.let { runCatching { it.invoke(null, this) as? CharSequence }.getOrNull() } ?: this
+
     private fun observeTimelineWindowBatch(
         starts: List<*>,
         ends: List<*>,
@@ -576,10 +575,7 @@ object CaptionHook : BaseHook {
             val startMs = (starts[index] as? Number)?.toLong() ?: continue
             val endMs = (ends[index] as? Number)?.toLong() ?: continue
             val text = texts[index] as? CharSequence ?: continue
-            val unwrappedText = textUnwrapper
-                ?.let { method -> runCatching { method.invoke(null, text) as? CharSequence }.getOrNull() }
-                ?: text
-            lines += TimelineLine(startMs, endMs, unwrappedText.toString())
+            lines += TimelineLine(startMs, endMs, text.unwrapTimelineText(textUnwrapper).toString())
         }
         val distinctEndCount = lines.mapTo(HashSet()) { it.endMs }.size
         val isRolling = lines.isNotEmpty() &&
@@ -729,13 +725,7 @@ object CaptionHook : BaseHook {
                 .map { boundary -> boundary.range.last + 1 }
                 .takeWhile { boundaryEnd -> boundaryEnd <= maximumEnd }
                 .filter { boundaryEnd -> boundaryEnd >= minimumEnd }
-                .minByOrNull { boundaryEnd ->
-                    if (boundaryEnd >= targetEnd) {
-                        boundaryEnd - targetEnd
-                    } else {
-                        targetEnd - boundaryEnd
-                    }
-                }
+                .minByOrNull { boundaryEnd -> kotlin.math.abs(boundaryEnd - targetEnd) }
             val splitIndex = clauseEnd
                 ?: closestWhitespace(text, minimumEnd, maximumEnd, targetEnd)
                 ?: maximumEnd
@@ -762,7 +752,7 @@ object CaptionHook : BaseHook {
         var closestDistance = Int.MAX_VALUE
         for (index in minimumEnd..maximumEnd) {
             if (index >= text.length || !text[index].isWhitespace()) continue
-            val distance = if (index >= targetEnd) index - targetEnd else targetEnd - index
+            val distance = kotlin.math.abs(index - targetEnd)
             if (distance < closestDistance) {
                 closest = index
                 closestDistance = distance
@@ -1049,10 +1039,9 @@ object CaptionHook : BaseHook {
             return null
         }
         val normalizedFullText = CaptionCue.normalize(fullText)
-        val currentText = texts
-            .filter { it != fullText }
-            .firstOrNull { normalizedFullText.startsWith(CaptionCue.normalize(it)) }
-            ?: fullText
+        val currentText = texts.firstOrNull {
+            it != fullText && normalizedFullText.startsWith(CaptionCue.normalize(it))
+        } ?: fullText
         val startMs = values.filterIsInstance<Long>().firstOrNull()
             ?: CaptionCue.UNKNOWN_TIME_MS
         val detectedRolling = CaptionCue.normalize(currentText) != normalizedFullText
@@ -1357,7 +1346,7 @@ object CaptionHook : BaseHook {
         if (CaptionCue.normalize(formatted.toString()) == fragment) {
             return renderedFragment
         }
-        val isAnchor = displayText == fragment || if (window.isRolling) {
+        val isAnchor = if (window.isRolling) {
             displayText.contains(fragment)
         } else {
             displayText.endsWith(fragment)
