@@ -1,8 +1,5 @@
 package icu.nullptr.polyglot.youtube
 
-import android.app.Activity
-import android.content.Context
-import android.content.ContextWrapper
 import android.os.Handler
 import android.os.Looper
 import android.text.Editable
@@ -45,7 +42,7 @@ object CaptionHook : BaseHook {
     private val rendererStates = WeakHashMap<Any, RendererState>()
     private val bilingualCaptionEntries = WeakHashMap<Any, List<String>>()
     private val bilingualCaptionOffsets = WeakHashMap<ViewGroup, BilingualCaptionOffsets>()
-    private val captionTextSizeStates = WeakHashMap<View, CaptionTextSizeState>()
+    private val captionBottomOffsets = WeakHashMap<View, CaptionBottomOffset>()
     private val captionWindowClasses = ConcurrentHashMap.newKeySet<Class<*>>()
     private val captionWindowFields = ConcurrentHashMap<Class<*>, List<Field>>()
     private val captionWindowTextFields = ConcurrentHashMap<Class<*>, List<Field>>()
@@ -65,7 +62,6 @@ object CaptionHook : BaseHook {
     private val rendererSequence = AtomicLong(0L)
     private val applyingTranslatedText = ThreadLocal.withInitial { false }
     private val rewritingCaptionWindow = ThreadLocal.withInitial { false }
-    private val reapplyingCaptionTextSize = ThreadLocal.withInitial { false }
 
     override fun install(dexkit: DexKitBridge): Int {
         var installed = 0
@@ -78,7 +74,7 @@ object CaptionHook : BaseHook {
             installed++
         }
 
-        if (installCaptionTextSizeHooks(dexkit)) {
+        if (installCaptionBottomSpacingHooks(dexkit)) {
             installed++
         }
 
@@ -112,7 +108,6 @@ object CaptionHook : BaseHook {
         mainHandler.post {
             if (module.config.enabled != enabled) return@post
 
-            refreshAllCaptionTextSizes()
             if (enabled) {
                 replayNativeCaptionWindowUpdates()
                 val activeWindows = activeCaptionWindows()
@@ -383,246 +378,88 @@ object CaptionHook : BaseHook {
         return installed > 0
     }
 
-    private fun installCaptionTextSizeHooks(dexkit: DexKitBridge): Boolean {
+    private fun installCaptionBottomSpacingHooks(dexkit: DexKitBridge): Boolean {
         val captionWindowClassNames = dexkit.findCaptionWindowClassNames()
-        val methods = dexkit.findCaptionWindowUpdateMethods(captionWindowClassNames)
-            .map { it.toMethod().declaringClass }
-            .filter { clazz -> ViewGroup::class.java.isAssignableFrom(clazz) }
-            .distinct()
-            .flatMap { clazz ->
-                clazz.declaredMethods.filter { method ->
-                    !Modifier.isStatic(method.modifiers) &&
-                            method.returnType == Void.TYPE &&
-                            method.parameterTypes.contentEquals(arrayOf(Float::class.javaPrimitiveType))
+        val methods = dexkit.findCaptionOverlayUpdateMethods(captionWindowClassNames)
+            .mapNotNull { candidate ->
+                var clazz: Class<*>? = candidate.toMethod().declaringClass
+                while (clazz != null && clazz != ViewGroup::class.java &&
+                    ViewGroup::class.java.isAssignableFrom(clazz)
+                ) {
+                    val layoutMethod = clazz.declaredMethods.firstOrNull { method ->
+                        method.name == "onLayout" && method.parameterTypes.contentEquals(
+                            arrayOf(
+                                Boolean::class.javaPrimitiveType,
+                                Int::class.javaPrimitiveType,
+                                Int::class.javaPrimitiveType,
+                                Int::class.javaPrimitiveType,
+                                Int::class.javaPrimitiveType,
+                            ),
+                        )
+                    }
+                    if (layoutMethod != null) return@mapNotNull layoutMethod
+                    clazz = clazz.superclass
                 }
+                null
             }
-            .onEach { method -> method.isAccessible = true }
+            .onEach { it.isAccessible = true }
             .distinctBy { it.stableId() }
 
         for (method in methods) {
             hook(method) { chain ->
-                if (reapplyingCaptionTextSize.get() == true) {
-                    return@hook chain.proceed()
+                val overlay = chain.thisObject as? ViewGroup ?: return@hook chain.proceed()
+                // Start each native layout from its own coordinates, without our last offset.
+                for (index in 0 until overlay.childCount) {
+                    restoreCaptionBottomOffset(overlay.getChildAt(index))
                 }
-
-                val window = chain.thisObject as? View ?: return@hook chain.proceed()
-                val requestedTextSize = (chain.getArg(0) as? Number)?.toFloat()
-                    ?: return@hook chain.proceed()
-                val fullscreen = module.config.enabled &&
-                        window.fullscreenCaptionWindowState() == true
-                val appliedTextSize = if (fullscreen) {
-                    requestedTextSize * FULLSCREEN_CAPTION_TEXT_SCALE
-                } else {
-                    requestedTextSize
+                val result = chain.proceed()
+                for (index in 0 until overlay.childCount) {
+                    refreshCaptionBottomSpacing(overlay.getChildAt(index))
                 }
-                val previousFullscreen = rememberCaptionTextSize(
-                    window = window,
-                    method = method,
-                    rawTextSize = requestedTextSize,
-                    appliedTextSize = appliedTextSize,
-                    fullscreen = fullscreen,
-                )
-                if (previousFullscreen != fullscreen) {
-                    logCaptionWindowMode(window, fullscreen, requestedTextSize)
-                }
-                scheduleCaptionTextSizeRefresh(window)
-
-                if (fullscreen) {
-                    chain.proceed(arrayOf(appliedTextSize))
-                } else {
-                    chain.proceed()
-                }
+                result
             }
-
-            logD(name, "Hooked caption text size: ${method.shortName()}")
+            logD(name, "Hooked caption bottom spacing: ${method.shortName()}")
         }
-
         if (methods.isEmpty()) {
-            logW(name, "Caption text size methods not found")
+            logW(name, "Caption overlay layout methods not found")
         }
         return methods.isNotEmpty()
     }
 
-    private fun rememberCaptionTextSize(
-        window: View,
-        method: Method,
-        rawTextSize: Float,
-        appliedTextSize: Float,
-        fullscreen: Boolean,
-    ): Boolean? = synchronized(captionTextSizeStates) {
-        val state = captionTextSizeStates[window]
-        val previousFullscreen = state?.fullscreen
-        if (state == null) {
-            captionTextSizeStates[window] = CaptionTextSizeState(
-                method = method,
-                rawTextSize = rawTextSize,
-                appliedTextSize = appliedTextSize,
-                fullscreen = fullscreen,
-            )
-        } else {
-            state.method = method
-            state.rawTextSize = rawTextSize
-            state.appliedTextSize = appliedTextSize
-            state.fullscreen = fullscreen
-        }
-        previousFullscreen
+    private fun restoreCaptionBottomOffset(window: View) {
+        val state = captionBottomOffsets[window] ?: return
+        window.offsetTopAndBottom(-state.offset)
+        state.offset = 0
     }
 
-    private fun scheduleCaptionTextSizeRefresh(window: View) {
-        val shouldPost = synchronized(captionTextSizeStates) {
-            val state = captionTextSizeStates[window] ?: return
-            if (state.refreshPosted) {
-                false
-            } else {
-                state.refreshPosted = true
-                true
-            }
+    private fun refreshCaptionBottomSpacing(window: View) {
+        val overlay = window.parent as? ViewGroup ?: return
+        val entries = window as? ViewGroup ?: return
+        val contentBottom = (0 until entries.childCount)
+            .map { entries.getChildAt(it) }
+            .filter { it.visibility == View.VISIBLE && it.height > 0 }
+            .maxOfOrNull { it.bottom + it.translationY }
+        if (contentBottom == null) {
+            restoreCaptionBottomOffset(window)
+            return
         }
-        if (!shouldPost) return
-
-        mainHandler.post {
-            synchronized(captionTextSizeStates) {
-                captionTextSizeStates[window]?.refreshPosted = false
-            }
-            bindCaptionTextSizeListeners(window)
-            refreshCaptionTextSize(window)
-        }
-    }
-
-    private fun bindCaptionTextSizeListeners(window: View) {
-        val state = synchronized(captionTextSizeStates) {
-            captionTextSizeStates[window]
-        } ?: return
-
-        if (state.attachListener == null) {
-            val listener = object : View.OnAttachStateChangeListener {
+        val state = captionBottomOffsets.getOrPut(window) {
+            window.addOnAttachStateChangeListener(object : View.OnAttachStateChangeListener {
                 override fun onViewAttachedToWindow(view: View) {
-                    scheduleCaptionTextSizeRefresh(view)
+                    mainHandler.post { refreshCaptionBottomSpacing(view) }
                 }
 
                 override fun onViewDetachedFromWindow(view: View) {
-                    unbindCaptionTextSizeParent(view)
+                    restoreCaptionBottomOffset(view)
                 }
-            }
-            state.attachListener = listener
-            window.addOnAttachStateChangeListener(listener)
+            })
+            CaptionBottomOffset()
         }
-
-        val parent = window.parent as? View
-        val previousParent = state.parent?.get()
-        if (previousParent === parent) return
-
-        previousParent?.let { oldParent ->
-            state.parentLayoutListener?.let(oldParent::removeOnLayoutChangeListener)
-        }
-        state.parent = parent?.let(::WeakReference)
-        state.parentLayoutListener = parent?.let {
-            val windowReference = WeakReference(window)
-            View.OnLayoutChangeListener { _, _, _, _, _, _, _, _, _ ->
-                windowReference.get()?.let(::scheduleCaptionTextSizeRefresh)
-            }.also(it::addOnLayoutChangeListener)
-        }
-    }
-
-    private fun unbindCaptionTextSizeParent(window: View) {
-        val state = synchronized(captionTextSizeStates) {
-            captionTextSizeStates[window]
-        } ?: return
-        state.parent?.get()?.let { parent ->
-            state.parentLayoutListener?.let(parent::removeOnLayoutChangeListener)
-        }
-        state.parent = null
-        state.parentLayoutListener = null
-    }
-
-    private fun refreshCaptionTextSize(window: View) {
-        if (Looper.myLooper() != Looper.getMainLooper()) {
-            scheduleCaptionTextSizeRefresh(window)
-            return
-        }
-        val fullscreenState = window.fullscreenCaptionWindowState() ?: return
-        val state = synchronized(captionTextSizeStates) {
-            captionTextSizeStates[window]
-        } ?: return
-        val fullscreen = module.config.enabled && fullscreenState
-        val appliedTextSize = if (fullscreen) {
-            state.rawTextSize * FULLSCREEN_CAPTION_TEXT_SCALE
-        } else {
-            state.rawTextSize
-        }
-        if (state.fullscreen == fullscreen &&
-            kotlin.math.abs(state.appliedTextSize - appliedTextSize) < CAPTION_TEXT_SIZE_EPSILON
-        ) {
-            return
-        }
-
-        state.fullscreen = fullscreen
-        state.appliedTextSize = appliedTextSize
-        logCaptionWindowMode(window, fullscreen, state.rawTextSize)
-        try {
-            reapplyingCaptionTextSize.set(true)
-            state.method.invoke(window, appliedTextSize)
-        } catch (e: Throwable) {
-            logW(name, "Unable to refresh caption text size", e)
-        } finally {
-            reapplyingCaptionTextSize.set(false)
-        }
-    }
-
-    private fun refreshAllCaptionTextSizes() {
-        val windows = synchronized(captionTextSizeStates) {
-            captionTextSizeStates.keys.toList()
-        }
-        windows.forEach(::scheduleCaptionTextSizeRefresh)
-    }
-
-    private fun logCaptionWindowMode(window: View, fullscreen: Boolean, rawTextSize: Float) {
-        val overlay = window.parent as? View
-        val root = overlay?.rootView
-        val metrics = window.resources.displayMetrics
-        logV(
-            name,
-            "Caption window mode changed, fullscreen=$fullscreen, " +
-                    "textSize=$rawTextSize, owner=${window.javaClass.simpleName}, " +
-                    "overlay=${overlay?.measuredWidth}x${overlay?.measuredHeight}, " +
-                    "root=${root?.measuredWidth}x${root?.measuredHeight}, " +
-                    "display=${metrics.widthPixels}x${metrics.heightPixels}",
-        )
-    }
-
-    private fun View.fullscreenCaptionWindowState(): Boolean? {
-        val overlay = parent as? View ?: return null
-        val overlayWidth = overlay.measuredWidth.takeIf { it > 0 } ?: overlay.width
-        val overlayHeight = overlay.measuredHeight.takeIf { it > 0 } ?: overlay.height
-        if (overlayWidth <= 0 || overlayHeight <= 0) return null
-        if (context.activityOrNull()?.isInPictureInPictureMode == true) return false
-
-        val root = overlay.rootView
-        val metrics = resources.displayMetrics
-        fun covers(width: Int, height: Int): Boolean {
-            if (width <= 0 || height <= 0) return false
-            val widthCoverage = overlayWidth.toFloat() / width
-            val heightCoverage = overlayHeight.toFloat() / height
-            return (widthCoverage >= FULLSCREEN_CAPTION_MIN_MAIN_COVERAGE ||
-                    heightCoverage >= FULLSCREEN_CAPTION_MIN_MAIN_COVERAGE) &&
-                    widthCoverage >= FULLSCREEN_CAPTION_MIN_CROSS_COVERAGE &&
-                    heightCoverage >= FULLSCREEN_CAPTION_MIN_CROSS_COVERAGE
-        }
-
-        val coversRoot = root !== overlay && covers(
-            root.measuredWidth.takeIf { it > 0 } ?: root.width,
-            root.measuredHeight.takeIf { it > 0 } ?: root.height,
-        )
-        return coversRoot || covers(metrics.widthPixels, metrics.heightPixels)
-    }
-
-    private fun Context.activityOrNull(): Activity? {
-        var current: Context? = this
-        while (current != null) {
-            if (current is Activity) return current
-            current = (current as? ContextWrapper)?.baseContext
-        }
-        return null
+        val nativeBottom = window.top - state.offset + window.translationY + contentBottom
+        val gap = (overlay.height - nativeBottom).coerceAtLeast(0f)
+        val offset = (gap * CAPTION_BOTTOM_GAP_REDUCTION).toInt()
+        window.offsetTopAndBottom(offset - state.offset)
+        state.offset = offset
     }
 
     private fun installCaptionEventHook(dexkit: DexKitBridge): Boolean {
@@ -1724,6 +1561,7 @@ object CaptionHook : BaseHook {
             offsets.appliedParentTranslationY = parentTranslationY.takeIf {
                 window?.isRolling == false && gap > 0f
             }
+            refreshCaptionBottomSpacing(parent)
         }
     }
 
@@ -1779,6 +1617,7 @@ object CaptionHook : BaseHook {
         if (parent.translationY == offsets.appliedParentTranslationY) {
             parent.translationY = offsets.parentTranslationY
         }
+        refreshCaptionBottomSpacing(parent)
     }
 
     private fun BilingualCaptionOffsets.captureExternalTransforms(parent: ViewGroup, first: View) {
@@ -2047,10 +1886,7 @@ object CaptionHook : BaseHook {
     private const val MAX_ROLLING_SEGMENT_LENGTH = 100
     private const val MIN_ROLLING_SEGMENT_LENGTH = 40
     private const val MAX_ROLLING_SEGMENT_GAP_MS = 5_000L
-    private const val FULLSCREEN_CAPTION_TEXT_SCALE = 0.7f
-    private const val FULLSCREEN_CAPTION_MIN_MAIN_COVERAGE = 0.9f
-    private const val FULLSCREEN_CAPTION_MIN_CROSS_COVERAGE = 0.5f
-    private const val CAPTION_TEXT_SIZE_EPSILON = 0.01f
+    private const val CAPTION_BOTTOM_GAP_REDUCTION = 1f / 3f
     private val sentenceBoundary = Regex("[.!?。！？…]+[\\\"'”’）)\\]]*(?=\\s|$)")
     private val clauseBoundary = Regex("[,;:，；：]+[\\\"'”’）)\\]]*(?=\\s|$)")
 
@@ -2090,16 +1926,7 @@ object CaptionHook : BaseHook {
         val argument: Any,
     )
 
-    private data class CaptionTextSizeState(
-        var method: Method,
-        var rawTextSize: Float,
-        var appliedTextSize: Float,
-        var fullscreen: Boolean,
-        var refreshPosted: Boolean = false,
-        var parent: WeakReference<View>? = null,
-        var parentLayoutListener: View.OnLayoutChangeListener? = null,
-        var attachListener: View.OnAttachStateChangeListener? = null,
-    )
+    private data class CaptionBottomOffset(var offset: Int = 0)
 
     private data class BilingualCaptionOffsets(
         val first: WeakReference<View>,
